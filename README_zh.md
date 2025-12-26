@@ -47,8 +47,8 @@ python infer_video.py \
   --tile_overlap 24 \
   --model_dir /app/models
 
-# 方法二：从宿主机直接运行
-docker exec flashvsr_ultra_fast python /app/FlashVSR_Ultra_Fast/infer_video.py \
+# 方法二：从宿主机直接运行（推荐使用 -w 参数指定工作目录）
+docker exec -w /app/FlashVSR_Ultra_Fast flashvsr_ultra_fast python /app/FlashVSR_Ultra_Fast/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output.mp4 \
   --mode tiny \
@@ -181,6 +181,14 @@ python infer_video.py \
 
 ## 安装步骤
 
+#### Docker 配置说明
+
+**GPU 配置：**
+- 默认配置：容器仅使用 GPU1 和 GPU2（物理 GPU），GPU0 不会被使用
+- 容器内重新编号：GPU1 和 GPU2 在容器内会被重新编号为 `cuda:0` 和 `cuda:1`
+- 多 GPU 模式：使用 `--multi_gpu` 时，会自动使用容器内可见的所有 GPU（即 GPU1 和 GPU2）
+- 如需修改 GPU 配置，请编辑 `docker-compose.yml` 中的 `NVIDIA_VISIBLE_DEVICES` 和 `device_ids` 参数
+
 #### 安装节点:
 ```bash
 cd ComfyUI/custom_nodes
@@ -249,8 +257,31 @@ python -m pip install -U triton<3.3.0
 - 使用 `--mode tiny-long`
 - 减小 `--tile_size`（如128或64）
 - 启用 `--unload_dit True`
-- 使用 `--scale 2` 或 `3` 而不是 `4`
+- 使用 `--scale 2` 或 `3` 或`4`
 - 减小 `--kv_ratio`（如1.0）
+
+### 视频读取问题
+
+**问题：`torchvision read_video failed: PyAV is not installed`**
+
+**解决方案：**
+1. 安装 PyAV（推荐，以获得更好的性能和兼容性）：
+   ```bash
+   pip install av
+   ```
+   或者重新安装所有依赖：
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. 如果未安装 PyAV，代码会自动回退到 OpenCV 或 FFmpeg，功能不受影响，但性能可能略低
+3. 确保已安装 FFmpeg（用于视频编解码）：
+   ```bash
+   # Ubuntu/Debian
+   sudo apt-get install -y ffmpeg libavcodec-dev
+   
+   # 或在 Docker 容器中
+   apt-get update && apt-get install -y ffmpeg libavcodec-dev
+   ```
 
 ### 多GPU使用注意事项
 

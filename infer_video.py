@@ -69,6 +69,39 @@ def get_available_memory_gb(device: str) -> float:
     used, total = get_gpu_memory_info(device)
     return total - used
 
+def get_system_memory_info() -> Tuple[float, float]:
+    """Get system RAM memory info (used, total) in GB.
+    
+    Returns:
+        (used_gb, total_gb): Used and total system memory in GB
+    """
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        total_gb = mem.total / (1024**3)
+        used_gb = mem.used / (1024**3)
+        return used_gb, total_gb
+    except ImportError:
+        # 如果没有psutil，尝试从/proc/meminfo读取
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+                for line in meminfo.split('\n'):
+                    if line.startswith('MemTotal:'):
+                        total_kb = int(line.split()[1])
+                        total_gb = total_kb / (1024**2)
+                    elif line.startswith('MemAvailable:'):
+                        avail_kb = int(line.split()[1])
+                        avail_gb = avail_kb / (1024**2)
+                        used_gb = total_gb - avail_gb
+                        return used_gb, total_gb
+        except Exception:
+            pass
+        return 0.0, 0.0
+    except Exception as e:
+        log(f"Error getting system memory info: {e}", "warning")
+        return 0.0, 0.0
+
 def estimate_tile_memory(tile_size: int, num_frames: int, scale: int, dtype_size: int = 2) -> float:
     """Estimate memory needed for processing one tile in GB.
     
@@ -634,8 +667,15 @@ def merge_video_segments(segments: List[Tuple[int, int, torch.Tensor]], original
     
     return merged
 
-def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args):
-    """Run inference using multiple GPUs in parallel."""
+def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, input_fps: float = 30.0):
+    """Run inference using multiple GPUs in parallel.
+    
+    Args:
+        frames: Full video frames tensor (N, H, W, C)
+        devices: List of device strings
+        args: Arguments namespace
+        input_fps: Input video FPS (to avoid re-reading video in workers)
+    """
     process_start = time.time()
     num_gpus = len(devices)
     if num_gpus == 0:
@@ -643,111 +683,374 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args):
     
     log(f"[Multi-GPU] Processing video with {num_gpus} GPUs", "info")
     
+    # 检查系统内存（RAM）
+    sys_used, sys_total = get_system_memory_info()
+    sys_free = sys_total - sys_used
+    log(f"[Multi-GPU] System RAM: {sys_free:.2f} GB free / {sys_total:.2f} GB total (used: {sys_used:.2f} GB)", "info")
+    if sys_free < 8.0:  # 至少需要8GB可用系统内存
+        log(f"[Multi-GPU] Warning: Low system RAM ({sys_free:.2f} GB). OOM risk! Each worker needs ~4-8GB RAM.", "warning")
+    
+    # 检查每个GPU的可用内存
+    log(f"[Multi-GPU] Checking GPU memory availability...", "info")
+    for device in devices:
+        used, total = get_gpu_memory_info(device)
+        free = total - used
+        log(f"[Multi-GPU] {device}: {free:.2f} GB free / {total:.2f} GB total (used: {used:.2f} GB)", "info")
+        if free < 2.0:  # 至少需要2GB可用内存
+            log(f"[Multi-GPU] Warning: {device} has low available memory ({free:.2f} GB). OOM risk!", "warning")
+    
+    # 保存原始帧数（在删除frames之前）
+    original_frame_count = frames.shape[0]
+    
     # 将视频分割成segments
     segments = split_video_by_frames(frames, num_gpus, overlap=10)
     log(f"[Multi-GPU] Split video into {len(segments)} segments", "info")
     for i, (start, end) in enumerate(segments):
-        log(f"[Multi-GPU] Segment {i}: frames {start}-{end} ({end-start} frames) -> GPU {devices[i % num_gpus]}", "info")
+        segment_frames = end - start
+        # 估算segment内存占用（假设每帧是1920x1080x3的float32）
+        estimated_memory_mb = segment_frames * 1920 * 1080 * 3 * 4 / (1024**2)  # 粗略估算
+        log(f"[Multi-GPU] Segment {i}: frames {start}-{end} ({segment_frames} frames, ~{estimated_memory_mb:.1f} MB) -> GPU {devices[i % num_gpus]}", "info")
     
-    # 使用多进程处理
-    ctx = mp.get_context('spawn')
-    result_queue = ctx.Queue()
-    processes = []
-    
-    # 准备参数字典
-    args_dict = vars(args)
-    
-    # 启动worker进程
-    log(f"[Multi-GPU] Launching {num_gpus} worker processes...", "info")
-    for i, (start_idx, end_idx) in enumerate(segments):
-        device = devices[i % num_gpus]
-        log(f"[Multi-GPU] Starting worker {i} on {device}", "info")
-        p = ctx.Process(
-            target=_worker_process,
-            args=(i, device, args.input, start_idx, end_idx, args_dict, result_queue)
-        )
-        p.start()
-        processes.append(p)
-        log(f"[Multi-GPU] Worker {i} process started (PID: {p.pid})", "info")
-    
-    log(f"[Multi-GPU] All workers started. Waiting for results...", "info")
-    log(f"[Multi-GPU] Monitoring progress (checking every 2 seconds)...", "info")
-    
-    # 收集结果（添加进度显示）
-    results = {}
-    completed = 0
-    total = num_gpus
-    last_progress_time = time.time()
-    
-    while completed < total:
-        try:
-            # 检查是否有进度消息
-            if not result_queue.empty():
-                result = result_queue.get(timeout=0.1)
-                
-                if result.get('type') == 'progress':
-                    # 显示进度消息
-                    log(f"[Worker {result['worker_id']}@{result['device']}] {result['stage']}: {result['message']}", "info")
-                    last_progress_time = time.time()
-                elif 'success' in result:
-                    # 这是最终结果
-                    completed += 1
-                    if result['success']:
-                        results[result['worker_id']] = {
-                            'start_idx': result['start_idx'],
-                            'end_idx': result['end_idx'],
-                            'path': result['path']
-                        }
-                        log(f"[Multi-GPU] Worker {result['worker_id']} completed ({completed}/{total})", "finish")
-                    else:
-                        log(f"[Multi-GPU] Worker {result['worker_id']} failed: {result['error']}", "error")
-                        raise RuntimeError(f"Worker {result['worker_id']} failed")
-            else:
-                # 如果没有消息，显示等待状态
-                elapsed = time.time() - last_progress_time
-                if elapsed > 5:
-                    log(f"[Multi-GPU] Still waiting... ({completed}/{total} completed, {elapsed:.1f}s since last update)", "info")
-                    last_progress_time = time.time()
-                    # 检查进程是否还活着
+    # 优化：在主进程中分割frames并保存为临时文件，避免每个worker都读取完整视频
+    # 进一步优化：保存后立即释放内存，避免同时保存多个segments
+    import tempfile
+    import numpy as np
+    import gc
+    temp_files = []
+    try:
+        log(f"[Multi-GPU] Saving frame segments to temporary files (one at a time to save memory)...", "info")
+        for i, (start_idx, end_idx) in enumerate(segments):
+            log(f"[Multi-GPU] Processing segment {i}...", "info")
+            frames_segment = frames[start_idx:end_idx].cpu().numpy()
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.npy')
+            np.save(temp_file.name, frames_segment)
+            temp_file.close()
+            temp_files.append(temp_file.name)
+            # 立即释放内存
+            del frames_segment
+            gc.collect()
+            log(f"[Multi-GPU] Saved segment {i} ({end_idx-start_idx} frames) to {temp_file.name}", "info")
+        
+        # 释放frames tensor的内存（如果可能）
+        # 注意：我们已经保存了 original_frame_count，所以可以安全删除 frames
+        del frames
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        log(f"[Multi-GPU] Released main process memory", "info")
+        
+        # 使用多进程处理
+        ctx = mp.get_context('spawn')
+        result_queue = ctx.Queue()
+        processes = []
+        
+        # 准备参数字典
+        args_dict = vars(args)
+        
+        # 启动worker进程
+        # 优化：错开启动时间，避免同时加载模型导致内存峰值过高
+        # 增加延迟时间，确保模型完全加载后再启动下一个进程
+        log(f"[Multi-GPU] Launching {num_gpus} worker processes (with staggered startup)...", "info")
+        for i, (start_idx, end_idx) in enumerate(segments):
+            device = devices[i % num_gpus]
+            # 再次检查GPU内存
+            used, total = get_gpu_memory_info(device)
+            free = total - used
+            log(f"[Multi-GPU] Starting worker {i} on {device} (available: {free:.2f} GB)", "info")
+            
+            p = ctx.Process(
+                target=_worker_process,
+                args=(i, device, temp_files[i], input_fps, args_dict, result_queue, start_idx, end_idx)
+            )
+            p.start()
+            processes.append(p)
+            log(f"[Multi-GPU] Worker {i} process started (PID: {p.pid})", "info")
+            # 错开启动：每个进程延迟 5 秒启动，给模型加载足够的时间
+            # 模型加载通常需要3-10秒，5秒延迟可以避免同时加载多个模型
+            if i < len(segments) - 1:  # 最后一个进程不需要延迟
+                log(f"[Multi-GPU] Waiting 5 seconds before starting next worker...", "info")
+                time.sleep(5)
+        
+        log(f"[Multi-GPU] All workers started. Waiting for results...", "info")
+        log(f"[Multi-GPU] Monitoring progress (checking every 2 seconds)...", "info")
+        
+        # 收集结果（添加进度显示）
+        results = {}
+        completed = 0
+        total = num_gpus
+        last_progress_time = time.time()
+        # 用于检测长期无进展且进程已退出的情况，避免死循环
+        last_message_time = time.time()
+        
+        while completed < total:
+            try:
+                # 检查是否有进度消息
+                if not result_queue.empty():
+                    result = result_queue.get(timeout=0.1)
+                    
+                    if result.get('type') == 'progress':
+                        # 显示进度消息
+                        log(f"[Worker {result['worker_id']}@{result['device']}] {result['stage']}: {result['message']}", "info")
+                        last_progress_time = time.time()
+                        last_message_time = time.time()
+                    elif result.get('type') == 'heartbeat':
+                        # 心跳消息，不显示但更新时间戳
+                        last_progress_time = time.time()
+                        last_message_time = time.time()
+                    elif 'success' in result:
+                        # 这是最终结果
+                        completed += 1
+                        if result['success']:
+                            results[result['worker_id']] = {
+                                'start_idx': result['start_idx'],
+                                'end_idx': result['end_idx'],
+                                'path': result['path']
+                            }
+                            log(f"[Multi-GPU] Worker {result['worker_id']} completed ({completed}/{total})", "finish")
+                        else:
+                            log(f"[Multi-GPU] Worker {result['worker_id']} failed: {result['error']}", "error")
+                            raise RuntimeError(f"Worker {result['worker_id']} failed")
+                    last_message_time = time.time()
+                else:
+                    # 如果没有消息，显示等待状态
+                    elapsed = time.time() - last_progress_time
+                    
+                    # 检查进程状态（更频繁地检查，以便及时发现问题）
                     alive_count = sum(1 for p in processes if p.is_alive())
-                    log(f"[Multi-GPU] {alive_count}/{len(processes)} processes are alive", "info")
+                    exit_codes = [p.exitcode for p in processes]
+                    
+                    # 检查是否有进程被杀死（-9 表示 SIGKILL，通常是 OOM）
+                    killed_processes = [i for i, p in enumerate(processes) if p.exitcode == -9]
+                    if killed_processes:
+                        killed_devices = [devices[i % num_gpus] for i in killed_processes]
+                        error_msg = f"Worker process(es) {killed_processes} were killed (SIGKILL, exit code -9). "
+                        error_msg += f"This usually indicates Out-Of-Memory (OOM). Devices: {killed_devices}. "
+                        error_msg += f"Exit codes: {exit_codes}\n"
+                        
+                        # 检查是GPU显存OOM还是系统内存OOM
+                        gpu_memory_ok = True
+                        for device in devices:
+                            used, total = get_gpu_memory_info(device)
+                            free = total - used
+                            if free < 1.0:  # GPU显存几乎用尽
+                                gpu_memory_ok = False
+                        
+                        # 检查系统内存
+                        sys_used, sys_total = get_system_memory_info()
+                        sys_free = sys_total - sys_used
+                        
+                        error_msg += "\n当前内存状态:\n"
+                        error_msg += f"  系统RAM: {sys_used:.2f} GB / {sys_total:.2f} GB used ({sys_free:.2f} GB free)\n"
+                        for device in devices:
+                            used, total = get_gpu_memory_info(device)
+                            free = total - used
+                            error_msg += f"  {device}: {used:.2f} GB / {total:.2f} GB used ({free:.2f} GB free)\n"
+                        
+                        # 判断OOM类型
+                        if not gpu_memory_ok:
+                            error_msg += "\n诊断: GPU显存不足 (GPU OOM)\n"
+                        elif sys_free < 2.0:
+                            error_msg += "\n诊断: 系统内存不足 (RAM OOM) - 这是最可能的原因！\n"
+                            error_msg += "  每个worker进程需要约4-8GB系统内存来加载模型和视频数据。\n"
+                            error_msg += f"  当前只有 {sys_free:.2f} GB可用，不足以支持 {num_gpus} 个worker进程。\n"
+                        else:
+                            error_msg += "\n诊断: 可能是系统内存不足 (RAM OOM)，或模型加载时临时内存峰值过高\n"
+                        
+                        log(error_msg, "error")
+                        log("OOM 解决方案建议:", "warning")
+                        if sys_free < 8.0:
+                            log("  [系统内存不足] 优先尝试以下方案:", "warning")
+                            log("  1. 减少GPU数量（使用更少的GPU，减少并发worker进程）", "warning")
+                            log("  2. 增加系统交换空间（swap space）", "warning")
+                            log("  3. 关闭其他占用内存的程序", "warning")
+                            log("  4. 使用更小的视频片段或降低视频分辨率", "warning")
+                        log("  5. 降低tile_size参数（减少每次处理的瓦片大小）", "warning")
+                        log("  6. 启用tiled_dit模式（如果可用）", "warning")
+                        log("  7. 降低precision（使用bf16而不是fp32）", "warning")
+                        raise RuntimeError(error_msg)
+                    
+                    # 如果进程数量减少，检查是否有异常退出的进程
+                    # 注意：正常完成的进程（退出码0）不应该被报告为错误
+                    # 退出码为0表示正常完成，消息可能在队列中等待处理，继续正常处理即可
+                    if alive_count < len(processes) and completed < total:
+                        # 只检查异常退出的进程（退出码非0且非None）
+                        # 退出码为0表示正常完成，消息会在队列中被正常处理
+                        dead_processes = [i for i, p in enumerate(processes) 
+                                        if not p.is_alive() and p.exitcode is not None and p.exitcode != 0]
+                        if dead_processes:
+                            error_msg = f"Worker process(es) {dead_processes} exited unexpectedly. Exit codes: {exit_codes}"
+                            log(error_msg, "error")
+                            for i in dead_processes:
+                                if exit_codes[i] == -9:
+                                    log(f"Process {i} was killed (SIGKILL) - likely OOM", "error")
+                                else:
+                                    log(f"Process {i} exited with code {exit_codes[i]}", "error")
+                            raise RuntimeError(error_msg)
+                        
+                        # 对于正常退出（退出码0）的进程，不报告错误
+                        # 它们的成功消息会在队列中被正常处理，主循环会继续等待
+                    
+                    # 检查进程是否卡住：进程还在运行但没有消息超过60秒
+                    if alive_count > 0 and (time.time() - last_message_time) > 60:
+                        stuck_processes = [i for i, p in enumerate(processes) if p.is_alive()]
+                        if stuck_processes:
+                            error_msg = f"Worker process(es) {stuck_processes} appear to be stuck (no messages for 60s). "
+                            error_msg += f"Processes are alive but not responding. Exit codes: {exit_codes}"
+                            log(error_msg, "error")
+                            log("建议：进程可能卡在模型加载或推理中，检查GPU显存和系统资源", "warning")
+                            # 不立即抛出异常，再等待一段时间
+                            if (time.time() - last_message_time) > 120:
+                                raise RuntimeError(error_msg)
+                    
+                    if elapsed > 5:
+                        log(f"[Multi-GPU] Still waiting... ({completed}/{total} completed, {elapsed:.1f}s since last update)", "info")
+                        last_progress_time = time.time()
+                        log(f"[Multi-GPU] {alive_count}/{len(processes)} processes are alive", "info")
+                        
+                        # 如果全部进程已经退出，但未完成，则中断并报告错误
+                        if alive_count == 0 and completed < total:
+                            error_msg = f"All worker processes exited prematurely. Exit codes: {exit_codes}"
+                            log(error_msg, "error")
+                            # 检查是否有 -9 退出码
+                            if -9 in exit_codes:
+                                log("检测到进程被 SIGKILL 杀死，可能是内存不足 (OOM)", "error")
+                            # 尝试获取最后的错误信息
+                            for i, p in enumerate(processes):
+                                if p.exitcode != 0:
+                                    if p.exitcode == -9:
+                                        log(f"Process {i} was killed (SIGKILL) - likely OOM", "error")
+                                    else:
+                                        log(f"Process {i} exited with code {p.exitcode}", "error")
+                            raise RuntimeError(error_msg)
+                        
+                        # 如果长时间无任何消息且进程数量减少，也视为异常
+                        if (time.time() - last_message_time) > 120 and completed < total:
+                            error_msg = f"No progress messages for 120s; possible worker hang/crash. Exit codes: {exit_codes}"
+                            log(error_msg, "error")
+                            if -9 in exit_codes:
+                                log("检测到进程被 SIGKILL 杀死，可能是内存不足 (OOM)", "error")
+                            raise RuntimeError(error_msg)
+                    time.sleep(0.5)
+            except RuntimeError as e:
+                # 重新抛出 RuntimeError，不要继续循环
+                raise
+            except Exception as e:
+                # 其他异常才继续循环
+                log(f"[Multi-GPU] Unexpected error in wait loop: {e}", "warning")
                 time.sleep(0.5)
-        except:
-            time.sleep(0.5)
-            continue
+                continue
+        
+        # 等待所有进程完成
+        log(f"[Multi-GPU] All workers finished. Waiting for processes to exit...", "info")
+        for i, p in enumerate(processes):
+            p.join(timeout=30)
+            if p.exitcode != 0:
+                log(f"[Multi-GPU] Process {i} exited with code {p.exitcode}", "error")
+            else:
+                log(f"[Multi-GPU] Process {i} exited successfully", "info")
+        
+        # 合并segments（从临时文件读取并清理）
+        log(f"[Multi-GPU] Merging {len(results)} segments...", "info")
+        segment_list = []
+        for i in sorted(results.keys()):
+            path = results[i]['path']
+            out = torch.load(path, map_location='cpu')
+            segment_list.append((results[i]['start_idx'], results[i]['end_idx'], out))
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+        merged_output = merge_video_segments(segment_list, original_frame_count)
+        process_time = time.time() - process_start
+        log(f"[Multi-GPU] Successfully processed and merged {num_gpus} segments", "finish")
+        log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
+        return merged_output
     
-    # 等待所有进程完成
-    log(f"[Multi-GPU] All workers finished. Waiting for processes to exit...", "info")
-    for i, p in enumerate(processes):
-        p.join(timeout=30)
-        if p.exitcode != 0:
-            log(f"[Multi-GPU] Process {i} exited with code {p.exitcode}", "error")
-        else:
-            log(f"[Multi-GPU] Process {i} exited successfully", "info")
-    
-    # 合并segments（从临时文件读取并清理）
-    log(f"[Multi-GPU] Merging {len(results)} segments...", "info")
-    segment_list = []
-    for i in sorted(results.keys()):
-        path = results[i]['path']
-        out = torch.load(path, map_location='cpu')
-        segment_list.append((results[i]['start_idx'], results[i]['end_idx'], out))
+    finally:
+        # 确保所有进程都被正确终止和清理
+        for i, p in enumerate(processes):
+            try:
+                if p.is_alive():
+                    log(f"[Multi-GPU] Terminating process {i} (PID: {p.pid})", "warning")
+                    try:
+                        p.terminate()
+                        p.join(timeout=5)
+                        if p.is_alive():
+                            log(f"[Multi-GPU] Force killing process {i} (PID: {p.pid})", "warning")
+                            p.kill()
+                            p.join(timeout=2)
+                            if p.is_alive():
+                                log(f"[Multi-GPU] Process {i} still alive after kill, may need manual cleanup", "error")
+                    except Exception as e:
+                        log(f"[Multi-GPU] Error terminating process {i}: {e}", "warning")
+                else:
+                    # 即使进程已退出，也确保 join 完成
+                    try:
+                        p.join(timeout=1)
+                    except:
+                        pass
+            except Exception as e:
+                log(f"[Multi-GPU] Error cleaning up process {i}: {e}", "warning")
+        
+        # 清理临时文件
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+                    log(f"[Multi-GPU] Cleaned up temporary file: {temp_file}", "info")
+            except Exception as e:
+                log(f"[Multi-GPU] Failed to remove temporary file {temp_file}: {e}", "warning")
+        
+        # 清理队列：清空队列并关闭
         try:
-            os.remove(path)
-        except Exception:
-            pass
+            # 清空队列中剩余的所有项目（使用非阻塞方式）
+            items_cleared = 0
+            while True:
+                try:
+                    result_queue.get_nowait()
+                    items_cleared += 1
+                except:
+                    break
+            if items_cleared > 0:
+                log(f"[Multi-GPU] Cleared {items_cleared} remaining items from queue", "info")
+            
+            # 关闭队列以释放资源
+            result_queue.close()
+            # 等待队列的后台线程完成
+            # 注意：join_thread() 不接受 timeout 参数，会一直等待直到完成
+            try:
+                result_queue.join_thread()
+            except Exception as join_error:
+                # 如果 join_thread 失败，记录但不阻止清理
+                log(f"[Multi-GPU] Queue join_thread warning: {join_error}", "warning")
+        except Exception as e:
+            log(f"[Multi-GPU] Error cleaning up queue: {e}", "warning")
+        finally:
+            # 确保队列对象被删除
+            try:
+                del result_queue
+            except:
+                pass
 
-    merged_output = merge_video_segments(segment_list, frames.shape[0])
-    process_time = time.time() - process_start
-    log(f"[Multi-GPU] Successfully processed and merged {num_gpus} segments", "finish")
-    log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
-    return merged_output
-
-def _worker_process(worker_id: int, device: str, video_path: str,
-                   start_idx: int, end_idx: int, args_dict: dict, result_queue: mp.Queue):
-    """Worker process for multi-GPU processing (separate function to avoid import issues)."""
+def _worker_process(worker_id: int, device: str, segment_file: str,
+                   input_fps: float, args_dict: dict, result_queue: mp.Queue,
+                   start_idx: int = 0, end_idx: int = 0):
+    """Worker process for multi-GPU processing (separate function to avoid import issues).
+    
+    Args:
+        worker_id: Worker process ID
+        device: CUDA device string (e.g., 'cuda:0')
+        segment_file: Path to temporary file containing pre-split frame segment (numpy .npy file)
+        input_fps: Input video FPS
+        args_dict: Arguments dictionary
+        result_queue: Queue for reporting progress and results
+        start_idx: Start frame index of this segment
+        end_idx: End frame index of this segment
+    """
+    heartbeat_timer = None
     try:
         import sys
+        import threading
         sys.stdout.flush()  # 确保输出立即显示
         sys.stderr.flush()
         
@@ -767,7 +1070,36 @@ def _worker_process(worker_id: int, device: str, video_path: str,
             print(f"[Worker {worker_id}@{device}] {stage}: {message}", flush=True)
             sys.stdout.flush()
         
+        # 添加心跳机制：每30秒发送一次心跳消息
+        def send_heartbeat():
+            """定期发送心跳消息，表明进程仍在运行"""
+            try:
+                result_queue.put({
+                    'worker_id': worker_id,
+                    'type': 'heartbeat',
+                    'stage': 'HEARTBEAT',
+                    'message': 'Process is alive',
+                    'device': device
+                }, block=False)
+            except:
+                pass
+        
+        def start_heartbeat():
+            """启动心跳定时器"""
+            nonlocal heartbeat_timer
+            if heartbeat_timer is not None:
+                heartbeat_timer.cancel()
+            heartbeat_timer = threading.Timer(30.0, heartbeat_loop)
+            heartbeat_timer.daemon = True
+            heartbeat_timer.start()
+        
+        def heartbeat_loop():
+            """心跳循环"""
+            send_heartbeat()
+            start_heartbeat()  # 重新启动定时器
+        
         report_progress("INIT", "Worker process started")
+        start_heartbeat()  # 启动心跳
         
         # 重新导入必要的模块（在子进程中）
         import os
@@ -782,6 +1114,16 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         if device.startswith("cuda:"):
             torch.cuda.set_device(int(device.split(":")[1]))
             report_progress("INIT", f"Set CUDA device to {device}")
+            
+            # 检查GPU内存
+            try:
+                used, total = get_gpu_memory_info(device)
+                free = total - used
+                report_progress("INIT", f"GPU memory: {free:.2f} GB free / {total:.2f} GB total (used: {used:.2f} GB)")
+                if free < 2.0:
+                    report_progress("WARNING", f"Low GPU memory ({free:.2f} GB). OOM risk!")
+            except Exception as e:
+                report_progress("WARNING", f"Could not check GPU memory: {e}")
         
         # 解析参数
         from argparse import Namespace
@@ -790,6 +1132,8 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         
         # 导入必要的模块（使用 src. 前缀，与主文件保持一致）
         report_progress("LOAD", "Loading model modules...")
+        # 在worker进程中，需要重新导入get_gpu_memory_info（因为spawn模式会重新导入模块）
+        # 但由于函数定义在模块顶层，应该可以直接访问
         from src.models.utils import clean_vram
         from src.models import wan_video_dit
         from src.models.model_manager import ModelManager
@@ -798,6 +1142,30 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         from src.pipelines.flashvsr_full import FlashVSRFullPipeline
         from src.pipelines.flashvsr_tiny import FlashVSRTinyPipeline
         from src.pipelines.flashvsr_tiny_long import FlashVSRTinyLongPipeline
+        
+        # 确保可以访问get_gpu_memory_info（在spawn模式下可能需要从模块获取）
+        try:
+            # 尝试直接使用（如果函数在模块作用域中）
+            _ = get_gpu_memory_info
+        except NameError:
+            # 如果不可用，从当前模块获取
+            import sys
+            current_module = sys.modules.get('__main__') or sys.modules.get('infer_video')
+            if current_module and hasattr(current_module, 'get_gpu_memory_info'):
+                get_gpu_memory_info = current_module.get_gpu_memory_info
+            else:
+                # 如果还是找不到，定义一个简单的版本
+                def get_gpu_memory_info(device: str):
+                    if device.startswith("cuda:"):
+                        try:
+                            idx = int(device.split(":")[1])
+                            torch.cuda.set_device(idx)
+                            total = torch.cuda.get_device_properties(idx).total_memory / (1024**3)
+                            reserved = torch.cuda.memory_reserved(idx) / (1024**3)
+                            return reserved, total
+                        except:
+                            return 0.0, 0.0
+                    return 0.0, 0.0
         
         # 处理attention_mode
         if args.attention_mode == "sparse_sage_attention":
@@ -841,7 +1209,14 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         }
         dtype = dtype_map.get(args.precision, torch.bfloat16)
         
+        # 优化：添加小延迟，进一步错开模型加载时间
+        import random
+        delay = random.uniform(0, 1)  # 0-1秒随机延迟
+        time.sleep(delay)
+        
         report_progress("LOAD", "Loading model weights...")
+        # 优化：直接加载到目标设备，避免先加载到 CPU 再转移（减少内存峰值）
+        # 但 ModelManager 需要先加载到 CPU，所以我们在加载后立即清理 CPU 缓存
         mm = ModelManager(torch_dtype=dtype, device="cpu")
         if args.mode == "full":
             mm.load_models([ckpt_path, vae_path])
@@ -856,31 +1231,60 @@ def _worker_process(worker_id: int, device: str, video_path: str,
             pipe.TCDecoder.load_state_dict(torch.load(tcd_path, map_location=device), strict=False)
             pipe.TCDecoder.clean_mem()
         
+        # 立即清理 CPU 内存，释放 ModelManager 占用的内存
+        del mm
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
         report_progress("LOAD", "Loading additional components...")
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
-        pipe.denoising_model().LQ_proj_in.load_state_dict(torch.load(lq_path, map_location="cpu"), strict=True)
-        pipe.denoising_model().LQ_proj_in.to(device)
+        # 优化：直接加载到目标设备，避免中间占用 CPU 内存
+        lq_state_dict = torch.load(lq_path, map_location=device)
+        pipe.denoising_model().LQ_proj_in.load_state_dict(lq_state_dict, strict=True)
+        del lq_state_dict
+        gc.collect()
+        
         pipe.to(device, dtype=dtype)
         pipe.enable_vram_management(num_persistent_param_in_dit=None)
         pipe.init_cross_kv(prompt_path=prompt_path)
         pipe.load_models_to_device(["dit", "vae"])
         
-        report_progress("PROCESS", "Pipeline initialized. Loading video and running inference...")
+        # 再次清理内存
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        report_progress("PROCESS", "Pipeline initialized. Loading frame segment...")
 
-        # 读取视频并裁剪到该段
-        from infer_video import read_video_to_tensor, run_inference
-        frames_all, input_fps = read_video_to_tensor(video_path)
-        # Clamp indices to avoid empty or negative-length segments
-        N = frames_all.shape[0]
-        start = max(0, min(start_idx, N))
-        end = max(start, min(end_idx, N))
-        if end <= start:
-            raise RuntimeError(f"[Worker {worker_id}] Empty segment after clamp: N={N}, start={start_idx}, end={end_idx}")
-        frames_segment = frames_all[start:end]
-        del frames_all
+        # 从临时文件加载预分割的帧segment（避免读取完整视频）
+        import numpy as np
+        try:
+            frames_segment_np = np.load(segment_file)
+            frames_segment = torch.from_numpy(frames_segment_np).float()
+            del frames_segment_np
+            report_progress("PROCESS", f"Loaded {frames_segment.shape[0]} frames from segment file")
+        except Exception as e:
+            error_msg = f"[Worker {worker_id}] Failed to load segment from {segment_file}: {e}"
+            report_progress("ERROR", error_msg)
+            raise RuntimeError(error_msg) from e
 
         # 执行推理
-        output = run_inference(pipe, frames_segment, device, dtype, args)
+        report_progress("PROCESS", f"Starting inference on {frames_segment.shape[0]} frames...")
+        try:
+            try:
+                output = run_inference(pipe, frames_segment, device, dtype, args)
+            except NameError:
+                # 如果函数不在命名空间中，从当前模块获取
+                import sys
+                current_module = sys.modules.get(__name__) or sys.modules.get('__main__')
+                run_inference = getattr(current_module, 'run_inference')
+                output = run_inference(pipe, frames_segment, device, dtype, args)
+        except Exception as inference_error:
+            # 捕获推理过程中的错误
+            import traceback
+            error_msg = f"Inference failed: {str(inference_error)}\n{traceback.format_exc()}"
+            report_progress("ERROR", error_msg)
+            raise RuntimeError(error_msg) from inference_error
 
         # 保存到临时文件，返回路径
         tmp_dir = os.path.join('/tmp', 'flashvsr_multigpu')
@@ -901,17 +1305,43 @@ def _worker_process(worker_id: int, device: str, video_path: str,
         del pipe, output, frames_segment
         clean_vram()
         
+        # 停止心跳
+        if heartbeat_timer is not None:
+            heartbeat_timer.cancel()
+        
     except Exception as e:
         import traceback
         error_msg = f"{str(e)}\n{traceback.format_exc()}"
         print(f"[Worker {worker_id} ERROR] {error_msg}", flush=True)
-        result_queue.put({
-            'worker_id': worker_id,
-            'start_idx': start_idx,
-            'end_idx': end_idx,
-            'error': error_msg,
-            'success': False
-        })
+        sys.stderr.write(f"[Worker {worker_id} ERROR] {error_msg}\n")
+        sys.stderr.flush()
+        try:
+            result_queue.put({
+                'worker_id': worker_id,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'error': error_msg,
+                'success': False
+            }, timeout=10)
+        except Exception as queue_error:
+            print(f"[Worker {worker_id} ERROR] Failed to put error in queue: {queue_error}", flush=True)
+            sys.stderr.write(f"[Worker {worker_id} ERROR] Failed to put error in queue: {queue_error}\n")
+            sys.stderr.flush()
+    except BaseException as e:
+        # 捕获所有异常，包括 SystemExit 和 KeyboardInterrupt
+        import traceback
+        error_msg = f"BaseException: {str(e)}\n{traceback.format_exc()}"
+        print(f"[Worker {worker_id} FATAL] {error_msg}", flush=True)
+        sys.stderr.write(f"[Worker {worker_id} FATAL] {error_msg}\n")
+        sys.stderr.flush()
+        # 停止心跳
+        if heartbeat_timer is not None:
+            heartbeat_timer.cancel()
+        raise
+    finally:
+        # 确保心跳定时器被停止
+        if heartbeat_timer is not None:
+            heartbeat_timer.cancel()
 
 # ==============================================================
 #                     Padding for Model Input
@@ -1135,9 +1565,37 @@ def run_inference(pipe, frames, device, dtype, args):
         N, H, W, C = frames.shape
         num_aligned_frames = largest_8n1_leq(N + 4) - 4
 
+        # 计算所需内存（GB）- 使用float16而不是float32
+        required_memory_gb = (num_aligned_frames * H * args.scale * W * args.scale * C * 2) / (1024**3)  # float16 = 2 bytes
+        # weight_sum_canvas也需要相同大小的内存
+        total_required_gb = required_memory_gb * 2  # canvas + weight_sum_canvas
+        
+        log(f"[Memory Check] Canvas size: {num_aligned_frames} frames × {H*args.scale}×{W*args.scale}×{C}, "
+            f"Required memory: {total_required_gb:.2f} GB (canvas: {required_memory_gb:.2f} GB + weight: {required_memory_gb:.2f} GB, using float16)", "info")
+        
+        # 检查系统可用内存
+        try:
+            sys_used, sys_total = get_system_memory_info()
+            sys_free = sys_total - sys_used
+            log(f"[Memory Check] System RAM: {sys_free:.2f} GB free / {sys_total:.2f} GB total", "info")
+            
+            if total_required_gb > sys_free * 0.8:  # 如果需求超过可用内存的80%
+                log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) exceeds 80% of available RAM ({sys_free:.2f} GB). "
+                    f"OOM risk! Consider:", "warning")
+                log(f"  - Using smaller scale (current: {args.scale})", "warning")
+                log(f"  - Processing shorter video segments", "warning")
+                log(f"  - Increasing system SWAP space", "warning")
+        except:
+            pass
+        
+        if total_required_gb > 200:  # 如果超过200GB
+            log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) is very large. "
+                f"Consider using smaller scale or shorter video.", "warning")
+        
+        # 使用float16而不是float32，减少50%内存占用
         final_output_canvas = torch.zeros(
             (num_aligned_frames, H * args.scale, W * args.scale, C),
-            dtype=torch.float32,
+            dtype=torch.float16,  # 改为float16以减少内存占用
             device="cpu",
         )
         weight_sum_canvas = torch.zeros_like(final_output_canvas)
