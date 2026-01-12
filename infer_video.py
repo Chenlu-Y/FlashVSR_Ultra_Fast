@@ -251,6 +251,138 @@ def pad_or_crop_video(frames):
     frames = frames[:, :, :new_H, :new_W]
     return frames
 
+class StreamingVideoWriter:
+    """流式视频写入器，支持追加写入帧，用于流式合成。
+    
+    使用FFmpeg管道实现真正的流式写入，避免将所有帧保存在内存中。
+    """
+    def __init__(self, path, fps=30, height=None, width=None, codec='libx264'):
+        self.path = path
+        self.fps = fps
+        self.height = height
+        self.width = width
+        self.codec = codec
+        self.process = None
+        self.frame_count = 0
+        self.initialized = False
+        
+        # 确保输出目录存在
+        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    
+    def _initialize(self, height, width):
+        """初始化FFmpeg进程"""
+        if self.initialized:
+            return
+        
+        self.height = height
+        self.width = width
+        
+        import subprocess
+        self.subprocess = subprocess
+        cmd = [
+            'ffmpeg',
+            '-y',  # Overwrite output file
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'rgb24',
+            '-r', str(self.fps),
+            '-i', 'pipe:0',  # Read from stdin
+            '-c:v', self.codec,
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            '-crf', '18',  # High quality
+            self.path
+        ]
+        
+        try:
+            self.process = self.subprocess.Popen(
+                cmd,
+                stdin=self.subprocess.PIPE,
+                stdout=self.subprocess.PIPE,
+                stderr=self.subprocess.PIPE
+            )
+            self.initialized = True
+            log(f"[StreamingVideoWriter] Initialized: {width}x{height} @ {self.fps}fps", "info")
+        except FileNotFoundError:
+            raise RuntimeError("FFmpeg not found. Streaming video writer requires FFmpeg.")
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize streaming video writer: {e}")
+    
+    def write_frames(self, frames):
+        """写入帧（可以是单个帧或帧序列）
+        
+        Args:
+            frames: torch.Tensor, shape (F, H, W, C) or (H, W, C)
+        """
+        if frames.ndim == 3:
+            frames = frames.unsqueeze(0)  # (H, W, C) -> (1, H, W, C)
+        
+        # 转换为numpy
+        frames_np = (frames.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
+        
+        # 初始化（使用第一帧的尺寸）
+        if not self.initialized:
+            F, H, W, C = frames_np.shape
+            self._initialize(H, W)
+        
+        # 写入帧
+        for frame in frames_np:
+            try:
+                self.process.stdin.write(frame.tobytes())
+                self.frame_count += 1
+            except BrokenPipeError:
+                raise RuntimeError("FFmpeg process terminated unexpectedly")
+            except Exception as e:
+                raise RuntimeError(f"Failed to write frame: {e}")
+    
+    def close(self):
+        """关闭写入器"""
+        if self.process:
+            # 根据帧数和分辨率动态计算超时时间
+            # 对于大视频（8K、高帧数），编码可能需要更长时间
+            # 估算：每帧约需要 0.1-0.5 秒编码时间（取决于分辨率和复杂度）
+            # 使用更保守的估算：每帧 1 秒，最小 30 秒，最大 600 秒（10分钟）
+            if self.frame_count > 0 and self.height and self.width:
+                # 计算像素数（影响编码时间）
+                pixels_per_frame = self.height * self.width
+                # 对于高分辨率视频，需要更多时间
+                # 8K (7680x4320) ≈ 33M pixels, 4K (3840x2160) ≈ 8M pixels
+                # 估算：每百万像素每帧需要约 0.03 秒
+                estimated_time_per_frame = max(0.1, (pixels_per_frame / 1e6) * 0.03)
+                timeout = max(30, min(600, self.frame_count * estimated_time_per_frame * 2))  # 2倍安全系数
+            else:
+                timeout = 300  # 默认5分钟
+            
+            try:
+                self.process.stdin.close()
+                log(f"[StreamingVideoWriter] Waiting for FFmpeg to finish encoding ({self.frame_count} frames, timeout: {timeout:.1f}s)...", "info")
+                self.process.wait(timeout=timeout)
+                if self.process.returncode != 0:
+                    stderr = self.process.stderr.read().decode('utf-8', errors='ignore')
+                    log(f"[StreamingVideoWriter] FFmpeg warning: {stderr[:200]}", "warning")
+                else:
+                    log(f"[StreamingVideoWriter] FFmpeg encoding completed successfully", "info")
+            except self.subprocess.TimeoutExpired:
+                self.process.kill()
+                log(f"[StreamingVideoWriter] FFmpeg process killed due to timeout ({timeout:.1f}s). Video may be incomplete!", "error")
+                log(f"[StreamingVideoWriter] This usually happens with very large videos. Consider increasing timeout or processing in smaller segments.", "warning")
+            except Exception as e:
+                log(f"[StreamingVideoWriter] Error closing: {e}", "warning")
+            finally:
+                self.process = None
+        
+        if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
+            log(f"[StreamingVideoWriter] Saved {self.frame_count} frames to {self.path}", "info")
+        else:
+            raise RuntimeError(f"Failed to create output video: {self.path}")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
 def save_video(frames, path, fps=30):
     """Save tensor video frames to MP4 with H.264 encoding for Windows compatibility.
     
@@ -748,8 +880,10 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
         
         # 启动worker进程
         # 优化：错开启动时间，避免同时加载模型导致内存峰值过高
-        # 增加延迟时间，确保模型完全加载后再启动下一个进程
-        log(f"[Multi-GPU] Launching {num_gpus} worker processes (with staggered startup)...", "info")
+        # 等待模型加载完成后再启动下一个进程，避免OOM
+        log(f"[Multi-GPU] Launching {num_gpus} worker processes (with model-loading-aware startup)...", "info")
+        model_loaded_flags = {}  # 跟踪每个worker的模型加载状态
+        
         for i, (start_idx, end_idx) in enumerate(segments):
             device = devices[i % num_gpus]
             # 再次检查GPU内存
@@ -757,29 +891,91 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
             free = total - used
             log(f"[Multi-GPU] Starting worker {i} on {device} (available: {free:.2f} GB)", "info")
             
+            # 检查系统内存
+            sys_used, sys_total = get_system_memory_info()
+            sys_free = sys_total - sys_used
+            log(f"[Multi-GPU] System RAM: {sys_free:.2f} GB free before starting worker {i}", "info")
+            if sys_free < 8.0:
+                log(f"[Multi-GPU] WARNING: Low system RAM ({sys_free:.2f} GB). Waiting longer before next worker...", "warning")
+            
             p = ctx.Process(
                 target=_worker_process,
                 args=(i, device, temp_files[i], input_fps, args_dict, result_queue, start_idx, end_idx)
             )
             p.start()
             processes.append(p)
+            model_loaded_flags[i] = False
             log(f"[Multi-GPU] Worker {i} process started (PID: {p.pid})", "info")
-            # 错开启动：每个进程延迟 5 秒启动，给模型加载足够的时间
-            # 模型加载通常需要3-10秒，5秒延迟可以避免同时加载多个模型
-            if i < len(segments) - 1:  # 最后一个进程不需要延迟
-                log(f"[Multi-GPU] Waiting 5 seconds before starting next worker...", "info")
-                time.sleep(5)
+            
+            # 等待模型加载完成后再启动下一个worker（避免OOM）
+            if i < len(segments) - 1:  # 最后一个进程不需要等待
+                log(f"[Multi-GPU] Waiting for worker {i} to finish loading model before starting next worker...", "info")
+                model_loaded = False
+                wait_start = time.time()
+                max_wait_time = 120  # 最多等待2分钟
+                
+                while not model_loaded and (time.time() - wait_start) < max_wait_time:
+                    # 检查进程是否还活着
+                    if not p.is_alive():
+                        exit_code = p.exitcode
+                        if exit_code == -9:
+                            raise RuntimeError(f"Worker {i} was killed (SIGKILL) during model loading - likely OOM!")
+                        elif exit_code is not None and exit_code != 0:
+                            raise RuntimeError(f"Worker {i} exited unexpectedly during model loading (exit code: {exit_code})")
+                    
+                    # 检查是否有进度消息
+                    try:
+                        while not result_queue.empty():
+                            result = result_queue.get(timeout=0.1)
+                            if result.get('worker_id') == i:
+                                if result.get('type') == 'progress':
+                                    stage = result.get('stage', '')
+                                    message = result.get('message', '')
+                                    # 检查是否模型加载完成（进入PROCESS阶段表示模型已加载）
+                                    if stage == 'PROCESS' and 'Loading frame segment' in message:
+                                        model_loaded = True
+                                        model_loaded_flags[i] = True
+                                        log(f"[Multi-GPU] Worker {i} model loaded successfully. Starting next worker...", "info")
+                                        break
+                                    elif stage == 'ERROR':
+                                        raise RuntimeError(f"Worker {i} error during model loading: {message}")
+                                elif result.get('type') == 'heartbeat':
+                                    # 心跳消息，继续等待
+                                    pass
+                    except:
+                        pass
+                    
+                    # 如果还没加载完成，等待一小段时间
+                    if not model_loaded:
+                        time.sleep(1)
+                
+                if not model_loaded:
+                    elapsed = time.time() - wait_start
+                    log(f"[Multi-GPU] WARNING: Worker {i} model loading timeout after {elapsed:.1f}s. Proceeding anyway...", "warning")
+                    # 继续启动下一个worker，但增加额外延迟
+                    time.sleep(10)  # 额外等待10秒
+                else:
+                    # 模型加载完成后，再等待几秒确保内存稳定
+                    time.sleep(3)
         
         log(f"[Multi-GPU] All workers started. Waiting for results...", "info")
         log(f"[Multi-GPU] Monitoring progress (checking every 2 seconds)...", "info")
         
         # 收集结果（添加进度显示）
+        # 流式合并：边处理边输出，减少内存占用
+        use_streaming = getattr(args, 'streaming_merge', True)  # 默认启用流式合并
         results = {}
         completed = 0
         total = num_gpus
         last_progress_time = time.time()
         # 用于检测长期无进展且进程已退出的情况，避免死循环
         last_message_time = time.time()
+        
+        # 流式写入器（如果启用）
+        streaming_writer = None
+        if use_streaming:
+            # 从第一个segment获取视频尺寸（需要等待第一个完成）
+            log(f"[Multi-GPU] Streaming merge enabled: will write segments as they complete", "info")
         
         while completed < total:
             try:
@@ -799,16 +995,43 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
                     elif 'success' in result:
                         # 这是最终结果
                         completed += 1
-                        if result['success']:
+                        if result.get('success', False):
                             results[result['worker_id']] = {
                                 'start_idx': result['start_idx'],
                                 'end_idx': result['end_idx'],
                                 'path': result['path']
                             }
                             log(f"[Multi-GPU] Worker {result['worker_id']} completed ({completed}/{total})", "finish")
+                            
+                            # 流式合并：如果启用，按顺序写入segments
+                            if use_streaming:
+                                # 初始化写入器（使用第一个完成的segment获取视频尺寸）
+                                # 但不立即写入，等待所有segments完成后再按start_idx顺序写入
+                                if streaming_writer is None:
+                                    # 加载segment获取尺寸（但不写入）
+                                    segment = torch.load(result['path'], map_location='cpu')
+                                    F, H, W, C = segment.shape
+                                    # 获取输出路径
+                                    output_path = getattr(args, 'output', None)
+                                    if not output_path:
+                                        output_path = os.path.join("/app/output", 
+                                                                  os.path.basename(getattr(args, 'input', 'output.mp4')).replace(".mp4", "_out.mp4"))
+                                    # 确保目录存在
+                                    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+                                    
+                                    streaming_writer = StreamingVideoWriter(
+                                        output_path, fps=input_fps, height=H, width=W
+                                    )
+                                    log(f"[Multi-GPU] Streaming writer initialized: {W}x{H} @ {input_fps}fps", "info")
+                                    log(f"[Multi-GPU] Will write segments in order by start_idx after all workers complete", "info")
+                                    
+                                    # 不立即写入，释放segment内存
+                                    del segment
+                                # 所有segments都先保存到results，最后按start_idx顺序写入
                         else:
-                            log(f"[Multi-GPU] Worker {result['worker_id']} failed: {result['error']}", "error")
-                            raise RuntimeError(f"Worker {result['worker_id']} failed")
+                            error_msg = result.get('error', 'Unknown error')
+                            log(f"[Multi-GPU] Worker {result['worker_id']} failed: {error_msg}", "error")
+                            raise RuntimeError(f"Worker {result['worker_id']} failed: {error_msg}")
                     last_message_time = time.time()
                 else:
                     # 如果没有消息，显示等待状态
@@ -948,23 +1171,84 @@ def run_inference_multi_gpu(frames: torch.Tensor, devices: List[str], args, inpu
             else:
                 log(f"[Multi-GPU] Process {i} exited successfully", "info")
         
-        # 合并segments（从临时文件读取并清理）
-        log(f"[Multi-GPU] Merging {len(results)} segments...", "info")
-        segment_list = []
-        for i in sorted(results.keys()):
-            path = results[i]['path']
-            out = torch.load(path, map_location='cpu')
-            segment_list.append((results[i]['start_idx'], results[i]['end_idx'], out))
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+        # 合并segments（流式或传统方式）
+        if use_streaming and streaming_writer is not None:
+            # 流式合并：按start_idx顺序写入所有segments（确保视频顺序正确）
+            log(f"[Multi-GPU] Streaming merge: writing all segments in order by start_idx...", "info")
+            
+            # 按start_idx顺序排序所有segments
+            sorted_results = sorted(results.items(), key=lambda x: x[1]['start_idx'])
+            # 构建segments顺序信息（避免f-string中的反斜杠问题）
+            segments_info = [f"worker_{wid}({r['start_idx']}-{r['end_idx']})" for wid, r in sorted_results]
+            log(f"[Multi-GPU] Segments order: {segments_info}", "info")
+            
+            last_end_idx = 0
+            
+            for worker_id, result_data in sorted_results:
+                # 检查文件是否存在
+                if not os.path.exists(result_data['path']):
+                    log(f"[Multi-GPU] WARNING: Segment file for worker {worker_id} not found: {result_data['path']}", "warning")
+                    continue
+                
+                # 加载segment
+                segment = torch.load(result_data['path'], map_location='cpu')
+                
+                # 处理overlap：跳过与上一个segment重叠的部分
+                if last_end_idx > 0 and result_data['start_idx'] < last_end_idx:
+                    overlap_frames = last_end_idx - result_data['start_idx']
+                    if overlap_frames < segment.shape[0]:
+                        segment = segment[overlap_frames:]
+                        log(f"[Multi-GPU] Skipped {overlap_frames} overlap frames for segment {worker_id} (start_idx={result_data['start_idx']}, last_end_idx={last_end_idx})", "info")
+                    elif overlap_frames >= segment.shape[0]:
+                        log(f"[Multi-GPU] WARNING: Segment {worker_id} is completely overlapped, skipping", "warning")
+                        del segment
+                        try:
+                            os.remove(result_data['path'])
+                        except:
+                            pass
+                        continue
+                
+                # 写入segment
+                if segment.shape[0] > 0:
+                    streaming_writer.write_frames(segment)
+                    log(f"[Multi-GPU] Written segment {worker_id} (frames {result_data['start_idx']}-{result_data['end_idx']}, {segment.shape[0]} frames written)", "info")
+                    last_end_idx = result_data['end_idx']
+                else:
+                    log(f"[Multi-GPU] WARNING: Segment {worker_id} has 0 frames after overlap removal", "warning")
+                
+                # 删除临时文件
+                try:
+                    os.remove(result_data['path'])
+                except:
+                    pass
+                del segment
+            
+            # 关闭写入器
+            streaming_writer.close()
+            process_time = time.time() - process_start
+            log(f"[Multi-GPU] Streaming merge completed", "finish")
+            log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
+            
+            # 流式模式下，返回None（视频已保存到文件）
+            return None
+        else:
+            # 传统合并方式：等待所有完成后再合并
+            log(f"[Multi-GPU] Merging {len(results)} segments...", "info")
+            segment_list = []
+            for i in sorted(results.keys()):
+                path = results[i]['path']
+                out = torch.load(path, map_location='cpu')
+                segment_list.append((results[i]['start_idx'], results[i]['end_idx'], out))
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
-        merged_output = merge_video_segments(segment_list, original_frame_count)
-        process_time = time.time() - process_start
-        log(f"[Multi-GPU] Successfully processed and merged {num_gpus} segments", "finish")
-        log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
-        return merged_output
+            merged_output = merge_video_segments(segment_list, original_frame_count)
+            process_time = time.time() - process_start
+            log(f"[Multi-GPU] Successfully processed and merged {num_gpus} segments", "finish")
+            log(f"[Multi-GPU] Processing time: {format_duration(process_time)}", "finish")
+            return merged_output
     
     finally:
         # 确保所有进程都被正确终止和清理
@@ -1130,6 +1414,14 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         args = Namespace(**args_dict)
         args.device = device
         
+        # 在 worker 进程中打印参数（帮助调试）
+        print(f"[Worker {worker_id}@{device}] [参数检查] 接收到的 tile 相关参数:", flush=True)
+        print(f"[Worker {worker_id}@{device}]   tiled_dit = {args.tiled_dit} (type: {type(args.tiled_dit).__name__})", flush=True)
+        print(f"[Worker {worker_id}@{device}]   tiled_vae = {args.tiled_vae} (type: {type(args.tiled_vae).__name__})", flush=True)
+        print(f"[Worker {worker_id}@{device}]   tile_size = {args.tile_size}", flush=True)
+        print(f"[Worker {worker_id}@{device}]   tile_overlap = {args.tile_overlap}", flush=True)
+        sys.stdout.flush()
+        
         # 导入必要的模块（使用 src. 前缀，与主文件保持一致）
         report_progress("LOAD", "Loading model modules...")
         # 在worker进程中，需要重新导入get_gpu_memory_info（因为spawn模式会重新导入模块）
@@ -1217,6 +1509,10 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         report_progress("LOAD", "Loading model weights...")
         # 优化：直接加载到目标设备，避免先加载到 CPU 再转移（减少内存峰值）
         # 但 ModelManager 需要先加载到 CPU，所以我们在加载后立即清理 CPU 缓存
+        # 在加载前先清理内存
+        import gc
+        gc.collect()
+        
         mm = ModelManager(torch_dtype=dtype, device="cpu")
         if args.mode == "full":
             mm.load_models([ckpt_path, vae_path])
@@ -1233,9 +1529,17 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         
         # 立即清理 CPU 内存，释放 ModelManager 占用的内存
         del mm
-        import gc
         gc.collect()
+        # 强制Python垃圾回收，释放更多内存
+        import sys
+        if hasattr(sys, 'getsizeof'):
+            # 触发更彻底的垃圾回收
+            for _ in range(3):
+                gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        # 报告模型加载完成，通知主进程可以启动下一个worker
+        report_progress("LOAD", "Model weights loaded, cleaning up temporary memory...")
         
         report_progress("LOAD", "Loading additional components...")
         pipe.denoising_model().LQ_proj_in = Buffer_LQ4x_Proj(in_dim=3, out_dim=1536, layer_num=1).to(device, dtype=dtype)
@@ -1252,8 +1556,11 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         
         # 再次清理内存
         gc.collect()
+        for _ in range(2):
+            gc.collect()
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
         
+        # 报告模型完全加载完成（这是关键消息，主进程会等待这个）
         report_progress("PROCESS", "Pipeline initialized. Loading frame segment...")
 
         # 从临时文件加载预分割的帧segment（避免读取完整视频）
@@ -1270,15 +1577,32 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
 
         # 执行推理
         report_progress("PROCESS", f"Starting inference on {frames_segment.shape[0]} frames...")
+        
+        # 确保run_inference函数可用（在spawn模式下可能需要重新导入）
         try:
-            try:
-                output = run_inference(pipe, frames_segment, device, dtype, args)
-            except NameError:
-                # 如果函数不在命名空间中，从当前模块获取
-                import sys
-                current_module = sys.modules.get(__name__) or sys.modules.get('__main__')
-                run_inference = getattr(current_module, 'run_inference')
-                output = run_inference(pipe, frames_segment, device, dtype, args)
+            # 尝试直接使用
+            _ = run_inference
+        except NameError:
+            # 如果不可用，从当前模块获取
+            import sys
+            current_module = sys.modules.get(__name__) or sys.modules.get('__main__')
+            if current_module and hasattr(current_module, 'run_inference'):
+                run_inference = current_module.run_inference
+            else:
+                # 如果还是找不到，尝试导入
+                try:
+                    from infer_video import run_inference
+                except ImportError:
+                    # 最后尝试：从文件路径导入
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("infer_video", "/app/FlashVSR_Ultra_Fast/infer_video.py")
+                    if spec and spec.loader:
+                        infer_video_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(infer_video_module)
+                        run_inference = infer_video_module.run_inference
+        
+        try:
+            output = run_inference(pipe, frames_segment, device, dtype, args)
         except Exception as inference_error:
             # 捕获推理过程中的错误
             import traceback
@@ -1503,6 +1827,107 @@ def process_tile_batch(pipe, frames, device, dtype, args, tile_batch: List[Tuple
     
     return results
 
+def run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, chunk_size_frames, N_original):
+    """按chunk流式处理视频，避免创建整个canvas。
+    
+    将视频分成多个chunks，每个chunk独立处理并立即流式写入，然后释放内存。
+    注意：这个函数直接处理chunk，不调用run_inference以避免递归。
+    """
+    N, H, W, C = frames.shape
+    
+    # 计算需要多少个chunks
+    num_chunks = (N + chunk_size_frames - 1) // chunk_size_frames
+    log(f"[Streaming] Processing video in {num_chunks} chunks (chunk size: {chunk_size_frames} frames)", "info")
+    
+    # 处理每个chunk
+    for chunk_idx in range(num_chunks):
+        start_frame = chunk_idx * chunk_size_frames
+        end_frame = min((chunk_idx + 1) * chunk_size_frames, N)
+        
+        # 提取chunk（需要包含一些重叠帧以确保边界平滑）
+        overlap_frames = 10  # 每个chunk前后各10帧重叠
+        chunk_start = max(0, start_frame - overlap_frames)
+        chunk_end = min(N, end_frame + overlap_frames)
+        
+        log(f"[Streaming] Processing chunk {chunk_idx + 1}/{num_chunks}: frames {chunk_start}-{chunk_end} "
+            f"(output frames: {start_frame}-{end_frame})", "info")
+        
+        # 提取chunk
+        chunk_frames = frames[chunk_start:chunk_end]
+        chunk_N_original = chunk_frames.shape[0]
+        
+        # 确保chunk至少有21帧
+        if chunk_frames.shape[0] < 21:
+            add = 21 - chunk_frames.shape[0]
+            last_frame = chunk_frames[-1:, :, :, :]
+            padding_frames = last_frame.repeat(add, 1, 1, 1)
+            chunk_frames = torch.cat([chunk_frames, padding_frames], dim=0)
+        
+        # 直接处理这个chunk（使用tiled_dit路径，但创建小的canvas）
+        chunk_N, chunk_H, chunk_W, chunk_C = chunk_frames.shape
+        chunk_num_aligned_frames = largest_8n1_leq(chunk_N + 4) - 4
+        
+        # 为这个chunk创建canvas（内存需求小得多）
+        chunk_canvas = torch.zeros(
+            (chunk_num_aligned_frames, chunk_H * args.scale, chunk_W * args.scale, chunk_C),
+            dtype=torch.float16,
+            device="cpu",
+        )
+        chunk_weight_canvas = torch.zeros_like(chunk_canvas)
+        
+        # 处理tiles
+        tile_coords = calculate_tile_coords(chunk_H, chunk_W, args.tile_size, args.tile_overlap)
+        batch_size = determine_optimal_batch_size(device, tile_coords, chunk_frames, args)
+        tile_batches = [tile_coords[i:i + batch_size] 
+                       for i in range(0, len(tile_coords), batch_size)]
+        
+        for batch_idx, tile_batch in enumerate(tile_batches):
+            results = process_tile_batch(pipe, chunk_frames, device, dtype, args, tile_batch, batch_idx)
+            
+            for result in results:
+                x1, y1, x2, y2 = result['coords']
+                processed_tile_cpu = result['tile']
+                mask_nhwc = result['mask']
+                
+                out_x1, out_y1 = x1 * args.scale, y1 * args.scale
+                tile_H_scaled = processed_tile_cpu.shape[1]
+                tile_W_scaled = processed_tile_cpu.shape[2]
+                out_x2, out_y2 = out_x1 + tile_W_scaled, out_y1 + tile_H_scaled
+                
+                chunk_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += processed_tile_cpu * mask_nhwc
+                chunk_weight_canvas[:, out_y1:out_y2, out_x1:out_x2, :] += mask_nhwc
+            
+            clean_vram()
+        
+        chunk_weight_canvas[chunk_weight_canvas == 0] = 1.0
+        chunk_output = chunk_canvas / chunk_weight_canvas
+        
+        # 裁剪回原始帧数
+        if chunk_output.shape[0] > chunk_N_original:
+            chunk_output = chunk_output[:chunk_N_original]
+        
+        # 裁剪掉重叠部分（除了第一个和最后一个chunk）
+        if chunk_idx > 0:
+            chunk_output = chunk_output[overlap_frames:]
+        if chunk_idx < num_chunks - 1:
+            chunk_output = chunk_output[:-overlap_frames]
+        
+        # 裁剪到实际需要的帧数
+        actual_frames_needed = end_frame - start_frame
+        if chunk_output.shape[0] > actual_frames_needed:
+            chunk_output = chunk_output[:actual_frames_needed]
+        
+        # 流式写入这个chunk
+        streaming_writer.write_frames(chunk_output)
+        log(f"[Streaming] Written chunk {chunk_idx + 1}/{num_chunks} ({chunk_output.shape[0]} frames)", "info")
+        
+        # 释放内存
+        del chunk_output, chunk_frames, chunk_canvas, chunk_weight_canvas
+        clean_vram()
+    
+    # 流式模式下返回None（视频已保存到文件）
+    return None
+
 def determine_optimal_batch_size(device: str, tile_coords: List[Tuple[int, int, int, int]], 
                                   frames: torch.Tensor, args) -> int:
     """Determine optimal batch size based on available GPU memory."""
@@ -1540,11 +1965,15 @@ def determine_optimal_batch_size(device: str, tile_coords: List[Tuple[int, int, 
     
     return optimal_batch
 
-def run_inference(pipe, frames, device, dtype, args):
+def run_inference(pipe, frames, device, dtype, args, streaming_writer=None):
     """Run inference; 支持整图与 DiT 瓦片两种路径（与 nodes.py 对齐）。
     
     新增功能：
     1. 动态batch_size：根据显存情况同时处理多个tile
+    2. 流式处理：当内存需求过大时，将视频分成chunks，每个chunk独立处理并流式写入
+    
+    Args:
+        streaming_writer: 可选的StreamingVideoWriter实例，用于流式写入
     """
     # 基本输入校验
     if frames is None or not hasattr(frames, 'shape') or frames.ndim != 4 or frames.shape[0] == 0:
@@ -1559,6 +1988,30 @@ def run_inference(pipe, frames, device, dtype, args):
         last_frame = frames[-1:, :, :, :]
         padding_frames = last_frame.repeat(add, 1, 1, 1)
         frames = torch.cat([frames, padding_frames], dim=0)
+
+    # 记录 tile 相关参数状态（帮助调试）
+    log(f"[Tile Settings] tiled_dit={args.tiled_dit} (type: {type(args.tiled_dit).__name__}), tiled_vae={args.tiled_vae} (type: {type(args.tiled_vae).__name__}), tile_size={args.tile_size}, tile_overlap={args.tile_overlap}", "info")
+    
+    # 详细说明 DiT tile 和 VAE tile 的影响
+    if args.tiled_dit:
+        log(f"[Tile Settings] ✓ DiT tile 已启用", "info")
+        log(f"[Tile Settings]   - DiT tile 影响：主要在 latent 空间处理，对最终图像的影响相对较小", "info")
+        log(f"[Tile Settings]   - DiT tile 可能产生的方块：通常不明显，因为后续 VAE 解码会平滑边界", "info")
+    else:
+        log(f"[Tile Settings] ✗ DiT tile 已禁用（整图处理）", "info")
+    
+    if args.tiled_vae:
+        log(f"[Tile Settings] ✓ VAE tile 已启用", "warning")
+        log(f"[Tile Settings]   - VAE tile 影响：直接在像素空间处理，对最终图像的影响最大！", "warning")
+        log(f"[Tile Settings]   - VAE tile 可能产生的方块：非常明显，因为是在最终输出图像上直接拼接", "warning")
+        log(f"[Tile Settings]   - 建议：如果看到明显的方块划分，优先禁用 VAE tile (--tiled_vae False)", "warning")
+    else:
+        log(f"[Tile Settings] ✗ VAE tile 已禁用（整图处理，无方块边界）", "info")
+    
+    log(f"[Tile Settings] 总结：对最终成像方块划分影响最大的是 VAE tile，而不是 DiT tile", "info")
+    
+    # 重要提示：如果使用多GPU模式，segments之间的边界也可能产生分块
+    log(f"[Tile Settings] 注意：多GPU模式下，视频会被分割成多个segments处理，segments边界也可能产生可见的分块", "warning")
 
     # 瓦片 DiT 路径：参考 nodes.py 的实现
     if args.tiled_dit:
@@ -1579,12 +2032,45 @@ def run_inference(pipe, frames, device, dtype, args):
             sys_free = sys_total - sys_used
             log(f"[Memory Check] System RAM: {sys_free:.2f} GB free / {sys_total:.2f} GB total", "info")
             
+            # 检查是否有足够内存创建canvas
+            # 需要保留一些安全边界（根据总内存动态调整）
+            # 对于大内存系统（>200GB），保留10GB；对于小内存系统，保留20GB
+            if sys_total > 200:
+                safe_memory_gb = sys_free - 10.0
+            else:
+                safe_memory_gb = sys_free - 20.0
+            
+            # 如果需求超过可用内存
+            if total_required_gb > sys_free:
+                # 如果只是稍微超过（5%以内），允许尝试（因为有SWAP空间和重试机制）
+                if total_required_gb <= sys_free * 1.05:
+                    log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) slightly exceeds available RAM ({sys_free:.2f} GB). "
+                        f"Will attempt allocation (SWAP space may be used, or will retry after other workers complete).", "warning")
+                    # 不抛出错误，继续到重试机制
+                else:
+                    # 超过太多，给出警告但允许尝试（让重试机制处理）
+                    log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) significantly exceeds available RAM ({sys_free:.2f} GB). "
+                        f"Will attempt allocation with retry mechanism. If all retries fail, consider:", "warning")
+                    log("  1. Use smaller scale (e.g., scale=2 instead of 4)", "warning")
+                    log("  2. Process shorter video segments", "warning")
+                    log("  3. Increase system SWAP space (recommended: 50-100GB)", "warning")
+                    log("  4. Use single GPU mode instead of multi-GPU", "warning")
+                    # 不抛出错误，继续到重试机制
+            
+            # 如果需求超过安全限制但仍在可用内存内，给出警告但允许继续
+            if total_required_gb > safe_memory_gb:
+                log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) exceeds safe limit ({safe_memory_gb:.2f} GB) "
+                    f"but is within available RAM ({sys_free:.2f} GB). Proceeding with caution...", "warning")
+                log("  Note: If OOM occurs, consider increasing SWAP space or using smaller scale.", "warning")
+            
             if total_required_gb > sys_free * 0.8:  # 如果需求超过可用内存的80%
                 log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) exceeds 80% of available RAM ({sys_free:.2f} GB). "
                     f"OOM risk! Consider:", "warning")
                 log(f"  - Using smaller scale (current: {args.scale})", "warning")
                 log(f"  - Processing shorter video segments", "warning")
                 log(f"  - Increasing system SWAP space", "warning")
+        except RuntimeError:
+            raise  # 重新抛出内存不足错误
         except:
             pass
         
@@ -1592,13 +2078,97 @@ def run_inference(pipe, frames, device, dtype, args):
             log(f"[WARNING] Canvas memory requirement ({total_required_gb:.2f} GB) is very large. "
                 f"Consider using smaller scale or shorter video.", "warning")
         
+        # 检查是否需要使用chunk流式处理
+        # 基于系统可用内存的比例来决定是否使用chunk流式处理
+        use_chunk_streaming = False
+        chunk_size_frames = None
+        if streaming_writer is not None:
+            # 计算内存阈值：使用系统可用内存的30%作为阈值
+            # 对于大内存系统（>200GB），使用30%；对于小内存系统，使用40%
+            if sys_total > 200:
+                memory_threshold_ratio = 0.30  # 大内存系统使用30%
+            else:
+                memory_threshold_ratio = 0.40  # 小内存系统使用40%
+            
+            memory_threshold_gb = sys_free * memory_threshold_ratio
+            
+            # 如果canvas内存需求超过阈值，使用chunk流式处理
+            if total_required_gb > memory_threshold_gb:
+                use_chunk_streaming = True
+                # 计算合适的chunk大小：每个chunk的canvas不超过可用内存的15%
+                # 这样确保有足够的内存用于其他操作
+                chunk_canvas_memory_ratio = 0.15
+                chunk_canvas_memory_gb = sys_free * chunk_canvas_memory_ratio
+                # 但至少保留2GB，最多使用20GB（避免在小内存系统上chunk太大）
+                chunk_canvas_memory_gb = max(2.0, min(chunk_canvas_memory_gb, 20.0))
+                
+                chunk_size_frames = int((chunk_canvas_memory_gb * (1024**3)) / (H * args.scale * W * args.scale * C * 2 * 2))  # 2个canvas
+                # 确保chunk大小至少为21帧（模型要求），且是8的倍数（对齐要求）
+                chunk_size_frames = max(21, chunk_size_frames)
+                chunk_size_frames = largest_8n1_leq(chunk_size_frames)
+                # 限制最大chunk大小为500帧，避免单个chunk仍然太大
+                chunk_size_frames = min(chunk_size_frames, 500)
+                log(f"[Streaming] Canvas memory requirement ({total_required_gb:.2f} GB) exceeds threshold ({memory_threshold_gb:.2f} GB, {memory_threshold_ratio*100:.0f}% of available RAM). "
+                    f"Will use chunk streaming with chunk size: {chunk_size_frames} frames (chunk canvas: {chunk_canvas_memory_gb:.2f} GB)", "info")
+        
+        # 如果使用chunk流式处理，不需要创建整个canvas
+        if use_chunk_streaming:
+            return run_inference_chunked(pipe, frames, device, dtype, args, streaming_writer, chunk_size_frames, N_original)
+        
+        # 如果提供了streaming_writer但不需要chunk处理，仍然需要创建canvas（但会在最后流式写入）
+        # 这种情况下，我们仍然创建canvas，但在最后通过streaming_writer写入
+        
         # 使用float16而不是float32，减少50%内存占用
-        final_output_canvas = torch.zeros(
-            (num_aligned_frames, H * args.scale, W * args.scale, C),
-            dtype=torch.float16,  # 改为float16以减少内存占用
-            device="cpu",
-        )
-        weight_sum_canvas = torch.zeros_like(final_output_canvas)
+        # 如果内存不足，等待并重试（适用于多GPU场景，前一个worker可能正在使用内存）
+        max_retries = 10
+        retry_delay = 5  # 每次重试等待5秒
+        canvas_allocated = False
+        
+        for retry in range(max_retries):
+            try:
+                # 在每次重试前检查内存
+                if retry > 0:
+                    try:
+                        sys_used, sys_total = get_system_memory_info()
+                        sys_free = sys_total - sys_used
+                        log(f"[Memory Check] Retry {retry}/{max_retries}: Available memory: {sys_free:.2f} GB", "info")
+                        if total_required_gb > sys_free:
+                            log(f"[Memory Check] Still insufficient memory. Waiting {retry_delay}s before retry...", "warning")
+                            time.sleep(retry_delay)
+                            continue
+                    except:
+                        pass
+                    time.sleep(retry_delay)
+                
+                final_output_canvas = torch.zeros(
+                    (num_aligned_frames, H * args.scale, W * args.scale, C),
+                    dtype=torch.float16,  # 改为float16以减少内存占用
+                    device="cpu",
+                )
+                weight_sum_canvas = torch.zeros_like(final_output_canvas)
+                log(f"[Memory Check] Successfully allocated canvas ({total_required_gb:.2f} GB)", "info")
+                canvas_allocated = True
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cannot allocate" in str(e).lower():
+                    if retry < max_retries - 1:
+                        log(f"[Memory Check] Failed to allocate canvas (attempt {retry + 1}/{max_retries}): {e}. "
+                            f"Waiting {retry_delay}s and retrying...", "warning")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        error_msg = (f"[ERROR] Failed to allocate canvas memory after {max_retries} attempts: {e}. "
+                                    f"Required: {total_required_gb:.2f} GB. "
+                                    f"Please use smaller scale or increase SWAP space.")
+                        log(error_msg, "error")
+                        raise RuntimeError(error_msg) from e
+                raise
+        
+        if not canvas_allocated:
+            error_msg = (f"[ERROR] Failed to allocate canvas after {max_retries} attempts. "
+                        f"Required: {total_required_gb:.2f} GB. "
+                        f"Please use smaller scale or increase SWAP space.")
+            raise RuntimeError(error_msg)
 
         tile_coords = calculate_tile_coords(H, W, args.tile_size, args.tile_overlap)
         
@@ -1650,9 +2220,17 @@ def run_inference(pipe, frames, device, dtype, args):
         if final_output.shape[0] > N_original:
             final_output = final_output[:N_original]
         
+        # 如果提供了streaming_writer，流式写入并返回None
+        if streaming_writer is not None:
+            streaming_writer.write_frames(final_output)
+            del final_output, final_output_canvas, weight_sum_canvas
+            clean_vram()
+            return None
+        
         return final_output
 
-    # 整图路径
+    # 整图路径（tiled_dit=False 时使用）
+    log(f"[Tile Settings] ✓ 使用整图处理路径（tiled_dit=False，不会产生 DiT tile 边界）", "info")
     LQ, th, tw, F = prepare_input_tensor(frames, device, scale=args.scale, dtype=dtype)
     if "long" not in args.mode:
         LQ = LQ.to(device)
@@ -1700,6 +2278,17 @@ def run_inference(pipe, frames, device, dtype, args):
 
 def main(args):
     total_start = time.time()
+    
+    # 打印所有 tile 相关参数（帮助调试）
+    log("=" * 80, "info")
+    log("[参数检查] 实际接收到的 tile 相关参数:", "info")
+    log(f"  --tiled_dit = {args.tiled_dit} (type: {type(args.tiled_dit).__name__})", "info")
+    log(f"  --tiled_vae = {args.tiled_vae} (type: {type(args.tiled_vae).__name__})", "info")
+    log(f"  --tile_size = {args.tile_size}", "info")
+    log(f"  --tile_overlap = {args.tile_overlap}", "info")
+    log(f"  --unload_dit = {args.unload_dit}", "info")
+    log("=" * 80, "info")
+    
     # 处理多GPU模式
     if args.multi_gpu:
         # 获取所有可用的CUDA设备
@@ -1724,13 +2313,18 @@ def main(args):
             frames, input_fps = read_video_to_tensor(args.input)
             
             # 使用多GPU处理
-            output = run_inference_multi_gpu(frames, devices, args)
+            output = run_inference_multi_gpu(frames, devices, args, input_fps)
             
-            # 保存视频（使用原始FPS）
-            output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
-            save_video(output, output_dir, fps=input_fps)
+            # 保存视频（流式模式下output为None，视频已保存）
+            if output is not None:
+                output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+                save_video(output, output_dir, fps=input_fps)
+                del output
+            else:
+                # 流式模式下，视频已保存到args.output
+                output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
             
-            del frames, output
+            del frames
             clean_vram()
             
             total_time = time.time() - total_start
@@ -1768,13 +2362,65 @@ def main(args):
     pipe = init_pipeline(args.mode, _device, dtype, args.model_dir)
     frames, input_fps = read_video_to_tensor(args.input)
     
-    output = run_inference(pipe, frames, _device, dtype, args)
+    # 检查是否需要流式处理（对于长视频，自动启用流式处理）
+    N, H, W, C = frames.shape
+    # 估算canvas内存需求
+    num_aligned_frames = largest_8n1_leq(N + 4) - 4
+    estimated_canvas_memory_gb = (num_aligned_frames * H * args.scale * W * args.scale * C * 2 * 2) / (1024**3)  # 2个canvas，float16
     
-    # 保存视频（使用原始FPS）
-    output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
-    save_video(output, output_dir, fps=input_fps)
+    # 基于系统可用内存的比例来决定是否启用流式处理
+    try:
+        sys_used, sys_total = get_system_memory_info()
+        sys_free = sys_total - sys_used
+        
+        # 计算内存阈值：使用系统可用内存的30%作为阈值
+        # 对于大内存系统（>200GB），使用30%；对于小内存系统，使用40%
+        if sys_total > 200:
+            memory_threshold_ratio = 0.30  # 大内存系统使用30%
+        else:
+            memory_threshold_ratio = 0.40  # 小内存系统使用40%
+        
+        memory_threshold_gb = sys_free * memory_threshold_ratio
+        use_streaming = estimated_canvas_memory_gb > memory_threshold_gb
+        
+        if use_streaming:
+            log(f"[Streaming] Estimated canvas memory: {estimated_canvas_memory_gb:.2f} GB exceeds threshold "
+                f"({memory_threshold_gb:.2f} GB, {memory_threshold_ratio*100:.0f}% of available RAM {sys_free:.2f} GB). "
+                f"Auto-enabling streaming mode.", "info")
+    except:
+        # 如果无法获取系统内存信息，使用保守的默认值（30GB）
+        memory_threshold_gb = 30.0
+        use_streaming = estimated_canvas_memory_gb > memory_threshold_gb
+        if use_streaming:
+            log(f"[Streaming] Estimated canvas memory: {estimated_canvas_memory_gb:.2f} GB exceeds threshold "
+                f"({memory_threshold_gb:.2f} GB, fallback). Auto-enabling streaming mode.", "info")
     
-    del pipe, frames, output
+    streaming_writer = None
+    
+    if use_streaming:
+        output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+        # 初始化streaming writer（需要先知道输出尺寸）
+        # 由于我们不知道确切的输出尺寸，先处理第一帧来获取尺寸
+        # 或者，我们可以从输入尺寸推断输出尺寸
+        output_H = H * args.scale
+        output_W = W * args.scale
+        streaming_writer = StreamingVideoWriter(output_dir, fps=input_fps, height=output_H, width=output_W)
+        log(f"[Streaming] Initialized streaming writer: {output_W}x{output_H} @ {input_fps}fps", "info")
+    
+    output = run_inference(pipe, frames, _device, dtype, args, streaming_writer=streaming_writer)
+    
+    # 如果使用流式处理，output为None，视频已保存
+    if output is None:
+        if streaming_writer is not None:
+            streaming_writer.close()
+        output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+    else:
+        # 保存视频（使用原始FPS）
+        output_dir = args.output if args.output else os.path.join("/app/output", os.path.basename(args.input).replace(".mp4", "_out.mp4"))
+        save_video(output, output_dir, fps=input_fps)
+        del output
+    
+    del pipe, frames
     clean_vram()
     
     total_time = time.time() - total_start
@@ -1791,12 +2437,23 @@ if __name__ == "__main__":
     
     # 从 nodes.py 添加所有参数
     parser.add_argument("--scale", type=int, default=2, choices=[2, 3, 4], help="Upscale factor")
-    parser.add_argument("--color_fix", type=bool, default=True, help="Use color fix")
-    parser.add_argument("--tiled_vae", type=bool, default=True, help="Use tiled VAE")
-    parser.add_argument("--tiled_dit", type=bool, default=False, help="Use tiled DiT")
+    # 布尔参数转换函数（正确处理 "True"/"False" 字符串）
+    def str_to_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ('yes', 'true', 't', 'y', '1'):
+            return True
+        elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+            return False
+        else:
+            raise argparse.ArgumentTypeError(f'Boolean value expected, got: {v}')
+    
+    parser.add_argument("--color_fix", type=str_to_bool, default=True, help="Use color fix (True/False)")
+    parser.add_argument("--tiled_vae", type=str_to_bool, default=True, help="Use tiled VAE (True/False)")
+    parser.add_argument("--tiled_dit", type=str_to_bool, default=False, help="Use tiled DiT (True/False)")
     parser.add_argument("--tile_size", type=int, default=256, help="Tile size")
     parser.add_argument("--tile_overlap", type=int, default=24, help="Tile overlap")
-    parser.add_argument("--unload_dit", type=bool, default=False, help="Unload DiT before decoding")
+    parser.add_argument("--unload_dit", type=str_to_bool, default=False, help="Unload DiT before decoding (True/False)")
     parser.add_argument("--sparse_ratio", type=float, default=2.0, help="Sparse ratio")
     parser.add_argument("--kv_ratio", type=float, default=3.0, help="KV ratio")
     parser.add_argument("--local_range", type=int, default=11, help="Local range")

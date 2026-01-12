@@ -160,8 +160,6 @@ python infer_video.py \
 - **显存 16-24GB**: `--mode tiny --scale 4 --tiled_dit True --tile_size 256 --adaptive_batch_size`
 - **显存 > 24GB**: `--mode full --scale 4 --tiled_dit True --tile_size 512 --adaptive_batch_size`
 
-详细优化指南请参阅 [OPTIMIZATION_GUIDE.md](./OPTIMIZATION_GUIDE.md)。
-
 ### ComfyUI 节点
 
 - **mode（模式）：**  

@@ -50,8 +50,6 @@ python infer_video.py \
 - **`--adaptive_batch_size`**: Enable adaptive tile batch size based on available GPU memory
 - **`--model_dir`**: Path to FlashVSR model directory (default: `/data01/volumes/flashvsr/`)
 
-For detailed optimization guide, see [OPTIMIZATION_GUIDE.md](./OPTIMIZATION_GUIDE.md).
-
 ### ComfyUI Nodes
 
 - **mode:**  
