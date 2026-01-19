@@ -449,6 +449,14 @@ class FlashVSRTinyPipeline(BasePipeline):
 
             latents = torch.cat(latents_total, dim=2)
             
+            # 在VAE解码前更积极地清理内存，避免OOM
+            del latents_total
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
             # Decode
             print("[FlashVSR] Starting VAE decoding...")
             frames = self.TCDecoder.decode_video(latents.transpose(1, 2),parallel=False, show_progress_bar=False, cond=LQ_video[:,:,:LQ_cur_idx,:,:]).transpose(1, 2).mul_(2).sub_(1)

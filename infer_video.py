@@ -2,6 +2,15 @@ import os
 import sys
 import math
 import argparse
+
+# 设置 LD_LIBRARY_PATH 以支持 block_sparse_attention
+# 确保在导入 torch 之前设置，以便后续导入的 C++ 扩展能找到 PyTorch 库
+_torch_lib_path = "/usr/local/lib/python3.10/dist-packages/torch/lib"
+if os.path.exists(_torch_lib_path):
+    _current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if _torch_lib_path not in _current_ld_path:
+        os.environ["LD_LIBRARY_PATH"] = f"{_torch_lib_path}:{_current_ld_path}"
+
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -2253,10 +2262,15 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
                     return 0.0, 0.0
         
         # 处理attention_mode
+        # 注意：最新版本的block_sparse_attention（2025/12更新）已支持Blackwell (sm_120)
         if args.attention_mode == "sparse_sage_attention":
             wan_video_dit.USE_BLOCK_ATTN = False
         else:
             wan_video_dit.USE_BLOCK_ATTN = True
+            # 如果BLOCK_ATTN_AVAILABLE为False，说明模块未正确安装或编译
+            if not wan_video_dit.BLOCK_ATTN_AVAILABLE:
+                log(f"[Worker {worker_id}] Warning: block_sparse_attention not available. Auto-switching to sparse_sage_attention", "warning")
+                wan_video_dit.USE_BLOCK_ATTN = False
         
         # 初始化pipeline
         report_progress("LOAD", "Initializing pipeline...")
@@ -3669,10 +3683,15 @@ def main(args):
             log(f"[Multi-GPU] Using {num_gpus} GPUs: {devices}", "info")
             
             # 处理 attention_mode
+            # 注意：最新版本的block_sparse_attention（2025/12更新）已支持Blackwell (sm_120)
             if args.attention_mode == "sparse_sage_attention":
                 wan_video_dit.USE_BLOCK_ATTN = False
             else:
                 wan_video_dit.USE_BLOCK_ATTN = True
+                # 如果BLOCK_ATTN_AVAILABLE为False，说明模块未正确安装或编译
+                if not wan_video_dit.BLOCK_ATTN_AVAILABLE:
+                    log(f"Warning: block_sparse_attention not available. Auto-switching to sparse_sage_attention", "warning")
+                    wan_video_dit.USE_BLOCK_ATTN = False
             
             # 使用多GPU处理（frames已在上面读取）
             output = run_inference_multi_gpu(frames, devices, args, input_fps)
@@ -3816,10 +3835,15 @@ def main(args):
         raise ValueError('The "tile_overlap" must be less than half of "tile_size"!')
     
     # 处理 attention_mode
+    # 注意：最新版本的block_sparse_attention（2025/12更新）已支持Blackwell (sm_120)
     if args.attention_mode == "sparse_sage_attention":
         wan_video_dit.USE_BLOCK_ATTN = False
     else:
         wan_video_dit.USE_BLOCK_ATTN = True
+        # 如果BLOCK_ATTN_AVAILABLE为False，说明模块未正确安装或编译
+        if not wan_video_dit.BLOCK_ATTN_AVAILABLE:
+            log(f"Warning: block_sparse_attention not available. Auto-switching to sparse_sage_attention", "warning")
+            wan_video_dit.USE_BLOCK_ATTN = False
     
     dtype_map = {
         "fp32": torch.float32,
