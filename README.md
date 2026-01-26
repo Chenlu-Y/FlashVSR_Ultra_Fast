@@ -1,12 +1,15 @@
-# ComfyUI-FlashVSR_Ultra_Fast
+# FlashVSR_Ultra_Fast
 Running FlashVSR on lower VRAM without any artifacts.   
 **[[📃中文版本](./README_zh.md)]**
 
 ## Changelog
 #### 2025-10-31
-- **New:** Standalone `infer_video.py` script for video processing without ComfyUI
+- **New:** Standalone `infer_video.py` script for video processing
 - **New:** Multi-GPU parallel processing (`--multi_gpu`) - automatically splits video by frames across GPUs
 - **New:** Adaptive tile batch size (`--adaptive_batch_size`) - dynamically adjusts tile concurrency based on GPU memory
+- **New:** Streaming mode (`--streaming`) - processes long videos in chunks to reduce memory usage
+- **New:** Segmented mode (`--segmented`) - processes video in sub-segments for single GPU scenarios
+- **New:** Resume from checkpoint (`--resume`) - automatically detects and merges completed frames from previous runs
 - **New:** GPU memory monitoring and optimization for 24-32GB GPUs
 - **New:** Total elapsed time tracking for performance monitoring
 - **Improved:** Video reading with OpenCV fallback for better codec compatibility
@@ -25,66 +28,8 @@ Running FlashVSR on lower VRAM without any artifacts.
 ## Preview
 ![](./img/preview.jpg)
 
-## Usage
-
-### Standalone Inference (New!)
-
-Use `scripts/infer_video.py` or `scripts/infer_video_distributed.py` for standalone video processing without ComfyUI:
-
-```bash
-# 单 GPU 或简单场景
-python scripts/infer_video.py \
-  --input ./inputs/video.mp4 \
-  --output ./results/output.mp4 \
-  --mode tiny \
-  --scale 4 \
-  --tiled_dit true \
-  --tile_size 256 \
-  --tile_overlap 64 \
-  --multi_gpu \
-  --adaptive_batch_size \
-  --model_dir /path/to/FlashVSR
-
-# 多 GPU 分布式推理（推荐）
-python scripts/infer_video_distributed.py \
-  --input ./inputs/video.mp4 \
-  --output ./results/output.mp4 \
-  --mode tiny \
-  --scale 4 \
-  --devices all
-```
-
-**Key Parameters:**
-- **`--multi_gpu`**: Enable multi-GPU parallel processing (splits video by frames across GPUs)
-- **`--adaptive_batch_size`**: Enable adaptive tile batch size based on available GPU memory
-- **`--model_dir`**: Path to FlashVSR model directory (default: `/data01/volumes/flashvsr/`)
-
-### ComfyUI Nodes
-
-- **mode:**  
-`tiny` -> faster (default); `full` -> higher quality  
-- **scale:**  
-`4` is always better, unless you are low on VRAM then use `2`    
-- **color_fix:**  
-Use wavelet transform to correct the color of output video.  
-- **tiled_vae:**  
-Set to True for lower VRAM consumption during decoding at the cost of speed.  
-- **tiled_dit:**  
-Significantly reduces VRAM usage at the cost of speed.
-- **tile\_size, tile\_overlap**:  
-How to split the input video.  
-- **unload_dit:**  
-Unload DiT before decoding to reduce VRAM peak at the cost of speed.  
-
 ## Installation
 
-#### nodes: 
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/lihaoyun6/ComfyUI-FlashVSR_Ultra_Fast.git
-python -m pip install -r ComfyUI-FlashVSR_Ultra_Fast/requirements.txt
-```
 📢: For Turing or older GPU, please install `triton<3.3.0`:  
 
 ```bash
@@ -94,35 +39,363 @@ python -m pip install -U triton-windows<3.3.0
 python -m pip install -U triton<3.3.0
 ```
 
-#### models:
+### Models
 
-- Download the entire `FlashVSR` folder with all the files inside it from [here](https://huggingface.co/JunhaoZhuang/FlashVSR) and put it in the `ComfyUI/models`
+- Download the entire `FlashVSR` folder with all the files inside it from [here](https://huggingface.co/JunhaoZhuang/FlashVSR) and put it in your model directory (default: `/app/models/v1.1/`)
 
 ```
-├── ComfyUI/models/FlashVSR
+├── FlashVSR
 |     ├── LQ_proj_in.ckpt
 |     ├── TCDecoder.ckpt
 |     ├── diffusion_pytorch_model_streaming_dmd.safetensors
 |     ├── Wan2.1_VAE.pth
 ```
 
+## Usage
+
+### Scripts Overview
+
+Two inference scripts are available:
+
+1. **`scripts/infer_video.py`**: Single-process inference with multi-GPU support via frame splitting
+2. **`scripts/infer_video_distributed.py`**: True distributed inference with model parallelism (recommended for multi-GPU setups)
+
+### Parameter Reference
+
+#### Basic Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--input` | str | **required** | Input video path or image sequence directory |
+| `--output` | str | None | Output video path (auto-generated if not specified) |
+| `--model_ver` | str | `1.1` | Model version: `1.0` or `1.1` |
+| `--mode` | str | `tiny` | Model mode: `tiny` (faster), `full` (higher quality), `tiny-long` (for long videos) |
+| `--device` | str | `cuda:0` | Device to use (ignored if `--multi_gpu` is used) |
+| `--scale` | int | `2` (infer_video.py)<br>`4` (infer_video_distributed.py) | Upscale factor: `2`, `3`, or `4` |
+
+#### Quality & Processing Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--color_fix` | bool | `True` | Use wavelet transform to correct output video color |
+| `--tiled_vae` | bool | `True` | Use tiled VAE for lower VRAM consumption (slower) |
+| `--tiled_dit` | bool | `False` | Use tiled DiT to significantly reduce VRAM usage (slower) |
+| `--tile_size` | int | `256` | Tile size for tiled processing |
+| `--tile_overlap` | int | `24` | Tile overlap in pixels |
+| `--unload_dit` | bool | `False` | Unload DiT before decoding to reduce VRAM peak (slower) |
+| `--precision` | str | `bf16` | Precision: `fp32`, `fp16`, or `bf16` |
+| `--attention_mode` | str | `sparse_sage_attention` | Attention mode: `sparse_sage_attention` or `block_sparse_attention` |
+| `--sparse_ratio` | float | `2.0` | Sparse attention ratio |
+| `--kv_ratio` | float | `3.0` | KV cache ratio |
+| `--local_range` | int | `11` | Local attention range |
+| `--seed` | int | `0` | Random seed for reproducibility |
+
+#### Performance Optimization Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--multi_gpu` | flag | False | Enable multi-GPU parallel processing (splits video by frames across GPUs) |
+| `--adaptive_batch_size` | flag | False | Enable adaptive tile batch size (dynamically adjusts based on GPU memory) |
+| `--streaming` | flag | False | Enable streaming mode for long videos (processes in chunks to reduce memory) |
+| `--segmented` | flag | False | Enable segmented processing mode (processes video in sub-segments, similar to `--multi_gpu` but for single worker) |
+| `--segment_overlap` | int | `2` | Number of overlap frames between segments/chunks (range: 1-10, recommended: 1-5) |
+| `--max-segment-frames` | int | None | Maximum frames per segment in segmented mode (default: auto-calculate based on memory) |
+
+#### Recovery & Checkpoint Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--resume` | flag | False | Resume from checkpoint: automatically detects and merges completed frames from previous runs (works with `--multi_gpu` and `--segmented`) |
+| `--clean-checkpoint` | flag | False | Clean checkpoint directory before starting (disable resume) |
+
+#### Distributed Inference Parameters (infer_video_distributed.py only)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--output_mode` | str | `video` | Output mode: `video` (video file) or `pictures` (image sequence) |
+| `--output_format` | str | `png` | When `output_mode=pictures`: `png` (8-bit) or `dpx10` (10-bit DPX) |
+| `--hdr_mode` | flag | False | Enable HDR mode: automatic HDR detection, tone mapping, and restoration |
+| `--tone_mapping_method` | str | `logarithmic` | Tone mapping method: `reinhard`, `logarithmic`, or `aces` |
+| `--tone_mapping_exposure` | float | `1.0` | Tone mapping exposure adjustment |
+| `--fps` | float | `30.0` | Frames per second (used when input is image sequence) |
+| `--devices` | str | None | GPU devices to use: `all` (use all GPUs) or comma-separated indices like `0,1,2` or `0-2` (range) |
+| `--master_addr` | str | `localhost` | Master address for distributed training |
+| `--master_port` | int | `29500` | Master port for distributed training |
+| `--use_shared_memory` | bool | `True` | Use shared memory (`/dev/shm`) for model loading (reduces memory usage) |
+| `--cleanup_mmap` | bool | `False` | Clean up memory-mapped canvas files after saving results |
+| `--tile_batch_size` | int | `0` | Number of tiles to process simultaneously (0 = auto-detect based on GPU memory) |
+| `--adaptive_tile_batch` | bool | `True` | Enable adaptive tile batch size based on available GPU memory |
+| `--max_frames` | int | None | Maximum number of frames to process (for testing) |
+
+### Full Parameter Command Templates
+
+#### infer_video.py - Full Template
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --model_ver 1.1 \
+  --mode tiny \
+  --device cuda:0 \
+  --scale 4 \
+  --color_fix True \
+  --tiled_vae True \
+  --tiled_dit False \
+  --tile_size 256 \
+  --tile_overlap 24 \
+  --unload_dit False \
+  --sparse_ratio 2.0 \
+  --kv_ratio 3.0 \
+  --local_range 11 \
+  --seed 0 \
+  --precision bf16 \
+  --attention_mode sparse_sage_attention \
+  --multi_gpu \
+  --adaptive_batch_size \
+  --streaming \
+  --segmented \
+  --resume \
+  --segment_overlap 2 \
+  --max-segment-frames 100
+```
+
+#### infer_video_distributed.py - Full Template
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --output_mode video \
+  --output_format png \
+  --hdr_mode \
+  --tone_mapping_method logarithmic \
+  --tone_mapping_exposure 1.0 \
+  --fps 30.0 \
+  --model_ver 1.1 \
+  --mode tiny \
+  --scale 4 \
+  --precision bf16 \
+  --attention_mode sparse_sage_attention \
+  --segment_overlap 2 \
+  --color_fix True \
+  --tiled_vae True \
+  --tiled_dit False \
+  --tile_size 256 \
+  --tile_overlap 24 \
+  --unload_dit False \
+  --sparse_ratio 2.0 \
+  --kv_ratio 3.0 \
+  --local_range 11 \
+  --seed 0 \
+  --master_addr localhost \
+  --master_port 29500 \
+  --use_shared_memory True \
+  --cleanup_mmap False \
+  --tile_batch_size 0 \
+  --adaptive_tile_batch True \
+  --max_frames None \
+  --devices all
+```
+
+### Scenario-Based Command Templates
+
+#### Scenario 1: Single GPU, Fast Processing (Default Settings)
+
+Best for: Quick tests, small videos, high VRAM GPUs (24GB+)
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4
+```
+
+#### Scenario 2: Single GPU, Low VRAM (8-16GB)
+
+Best for: Limited VRAM, need to reduce memory usage
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --tiled_dit True \
+  --tiled_vae True \
+  --tile_size 256 \
+  --tile_overlap 24 \
+  --unload_dit True
+```
+
+#### Scenario 3: Multi-GPU Setup (2+ GPUs)
+
+Best for: Multiple GPUs available, want maximum speed
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --multi_gpu \
+  --adaptive_batch_size
+```
+
+Or use the distributed version (recommended):
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --devices all
+```
+
+#### Scenario 4: Long Video Processing
+
+Best for: Very long videos, need to avoid OOM errors
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/long_video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny-long \
+  --scale 4 \
+  --streaming \
+  --segmented \
+  --segment_overlap 2
+```
+
+#### Scenario 5: High Quality Output
+
+Best for: Maximum quality, speed is secondary
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode full \
+  --scale 4 \
+  --precision fp32 \
+  --color_fix True
+```
+
+#### Scenario 6: Resume from Interrupted Processing
+
+Best for: Recovering from crashes or interruptions
+
+```bash
+python scripts/infer_video.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --multi_gpu \
+  --resume
+```
+
+#### Scenario 7: HDR Video Processing (Distributed Only)
+
+Best for: HDR input videos, preserving HDR information
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/hdr_video.mp4 \
+  --output_mode pictures \
+  --output ./results/hdr_frames \
+  --output_format dpx10 \
+  --hdr_mode \
+  --tone_mapping_method logarithmic \
+  --tone_mapping_exposure 1.0 \
+  --mode tiny \
+  --scale 4 \
+  --devices all
+```
+
+#### Scenario 8: Image Sequence Input/Output
+
+Best for: Working with image sequences, frame-by-frame control
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/frames/ \
+  --output_mode pictures \
+  --output ./results/output_frames \
+  --output_format png \
+  --fps 30.0 \
+  --mode tiny \
+  --scale 4 \
+  --devices all
+```
+
+#### Scenario 9: Testing with Limited Frames
+
+Best for: Quick testing, debugging
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/test_output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --max_frames 10 \
+  --devices all
+```
+
+#### Scenario 10: Maximum Performance (Multi-GPU + All Optimizations)
+
+Best for: Production environments, maximum throughput
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --devices all \
+  --adaptive_tile_batch True \
+  --use_shared_memory True \
+  --tile_batch_size 0 \
+  --precision bf16
+```
+
 ## Performance Optimization
 
 ### Multi-GPU Processing
+
 For systems with 2+ GPUs, enable `--multi_gpu` to achieve near-linear speedup:
 - Automatically splits video frames across available GPUs
 - Each GPU processes a video segment independently
 - Results are merged seamlessly with overlap handling
 
 ### Adaptive Batch Size
+
 Enable `--adaptive_batch_size` to maximize GPU utilization:
 - Dynamically adjusts tile batch size based on available VRAM
 - For 32GB GPUs, can process 6-16 tiles concurrently
 - Automatically rebalances during processing if memory changes
 
+### Streaming Mode
+
+Enable `--streaming` for long videos:
+- Processes video in chunks to reduce memory usage
+- Automatically enabled when canvas memory exceeds threshold
+- Recommended for videos longer than 1000 frames
+
+### Segmented Mode
+
+Enable `--segmented` for single GPU scenarios:
+- Similar to `--multi_gpu` but works within a single worker
+- Processes video in sub-segments independently
+- Can be combined with `--multi_gpu` for two-layer segmentation
+
 **Expected Performance:**
 - **2 GPUs + Adaptive Batch**: 3-5x speedup compared to single GPU
 - **VRAM Usage**: 20-25GB peak on 32GB GPUs (vs 13GB without optimizations)
+- **Streaming Mode**: Can handle videos of any length with constant memory usage
 
 ## Multi-GPU + Segmented Mode Details
 
@@ -277,4 +550,3 @@ python tools/find_unmerged.py
 ## Acknowledgments
 - [FlashVSR](https://github.com/OpenImagingLab/FlashVSR) @OpenImagingLab  
 - [Sparse_SageAttention](https://github.com/jt-zhang/Sparse_SageAttention_API) @jt-zhang
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI) @comfyanonymous

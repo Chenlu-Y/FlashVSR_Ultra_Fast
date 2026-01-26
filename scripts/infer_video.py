@@ -2290,6 +2290,13 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
         prompt_path = os.path.join(_project_root, "data", "posi_prompt.pth")
         
+        # 验证 prompt_path 存在
+        if not os.path.exists(prompt_path):
+            raise RuntimeError(f"[Worker {worker_id}] Missing prompt file: {prompt_path}\n"
+                              f"  Expected at: {prompt_path}\n"
+                              f"  Project root: {_project_root}\n"
+                              f"  Please ensure data/posi_prompt.pth exists in the project root.")
+        
         # 验证必需的文件是否存在
         required_files = [ckpt_path]
         if args.mode == "full":
@@ -2592,6 +2599,13 @@ def init_pipeline(mode, device, dtype, model_dir):
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
     prompt_path = os.path.join(_project_root, "data", "posi_prompt.pth")
+    
+    # 验证 prompt_path 存在
+    if not os.path.exists(prompt_path):
+        raise RuntimeError(f"Missing prompt file: {prompt_path}\n"
+                          f"  Expected at: {prompt_path}\n"
+                          f"  Project root: {_project_root}\n"
+                          f"  Please ensure data/posi_prompt.pth exists in the project root.")
 
     for p in [ckpt_path, vae_path, lq_path, tcd_path]:
         if not os.path.exists(p):

@@ -174,12 +174,8 @@ try:
 except ImportError:
     HDR_TONE_MAPPING_AVAILABLE = False
 
-# 将项目根目录添加到 sys.path
-_project_root = os.path.dirname(os.path.abspath(__file__))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
-
 # ====== FlashVSR modules ======
+# 注意：_project_root 已在第 135 行定义，不要重复定义
 from src.models.model_manager import ModelManager
 from src.models.TCDecoder import build_tcdecoder
 from src.models.utils import Buffer_LQ4x_Proj, clean_vram
@@ -1094,6 +1090,13 @@ def init_pipeline_distributed(rank: int, world_size: int, mode: str, dtype: torc
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
     prompt_path = os.path.join(_project_root, "data", "posi_prompt.pth")
+    
+    # 验证 prompt_path 存在
+    if not os.path.exists(prompt_path):
+        raise RuntimeError(f"[Rank {rank}] Missing prompt file: {prompt_path}\n"
+                          f"  Expected at: {prompt_path}\n"
+                          f"  Project root: {_project_root}\n"
+                          f"  Please ensure data/posi_prompt.pth exists in the project root.")
     
     # 验证文件存在
     required_files = [ckpt_path]
