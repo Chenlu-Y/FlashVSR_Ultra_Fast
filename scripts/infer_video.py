@@ -27,8 +27,8 @@ import json
 import glob
 import gc
 
-# 将项目根目录添加到 sys.path，而不是 src 目录
-_project_root = os.path.dirname(os.path.abspath(__file__))
+# 将项目根目录添加到 sys.path（scripts/ 的父目录）
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
@@ -2288,7 +2288,7 @@ def _worker_process(worker_id: int, device: str, segment_file: str,
         vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
         lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
         tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-        prompt_path = os.path.join(script_dir, "posi_prompt.pth")
+        prompt_path = os.path.join(_project_root, "data", "posi_prompt.pth")
         
         # 验证必需的文件是否存在
         required_files = [ckpt_path]
@@ -2591,7 +2591,7 @@ def init_pipeline(mode, device, dtype, model_dir):
     vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-    prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posi_prompt.pth")
+    prompt_path = os.path.join(_project_root, "data", "posi_prompt.pth")
 
     for p in [ckpt_path, vae_path, lq_path, tcd_path]:
         if not os.path.exists(p):

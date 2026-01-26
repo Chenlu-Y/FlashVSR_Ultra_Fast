@@ -18,13 +18,28 @@ FlashVSR 分布式推理脚本
 
 使用方法：
     # 基本用法（自动使用所有可见GPU）
-    python infer_video_distributed.py --input video.mp4 --output output.mp4
+    python scripts/infer_video_distributed.py --input video.mp4 --output output.mp4
+    
+    # 图片序列：默认 PNG；10-bit DPX 用 --output_format dpx10
+    python scripts/infer_video_distributed.py --input video.mp4 --output_mode pictures --output /path/to/frames
+    python scripts/infer_video_distributed.py --input video.mp4 --output_mode pictures --output /path/to/frames --output_format dpx10
+    
+    # HDR 模式：自动检测 HDR 输入，应用 Tone Mapping，超分后还原高光
+    # 推荐使用 --output_format dpx10 输出 HDR 图像序列（保留 HDR 信息）
+    python scripts/infer_video_distributed.py \
+        --input hdr_dpx_sequence \
+        --output_mode pictures \
+        --output /path/to/output \
+        --output_format dpx10 \
+        --hdr_mode \
+        --tone_mapping_method logarithmic \
+        --tone_mapping_exposure 1.0
     
     # 指定使用的GPU（使用 --devices 参数）
-    python infer_video_distributed.py --input video.mp4 --output output.mp4 --devices 0,1,2,3
+    python scripts/infer_video_distributed.py --input video.mp4 --output output.mp4 --devices 0,1,2,3
     
     # 16K-32K 大分辨率视频（推荐使用更大的 tile_size）
-    python infer_video_distributed.py \
+    python scripts/infer_video_distributed.py \
         --input 16k_video.mp4 \
         --output 16k_2x.mp4 \
         --mode tiny \
@@ -34,7 +49,7 @@ FlashVSR 分布式推理脚本
         --devices all
     
     # 完整参数示例（包含新功能）
-    python infer_video_distributed.py \
+    python scripts/infer_video_distributed.py \
         --input video.mp4 \
         --output output_4x.mp4 \
         --model_ver 1.1 \
@@ -51,14 +66,14 @@ FlashVSR 分布式推理脚本
     # 断点续跑：如果任务中断，直接重新运行相同命令即可自动恢复
     # 已处理的 tiles 会自动跳过，从断点继续
     
-    # 检查状态和恢复（使用恢复工具）
-    python recover_distributed_inference.py \
-        --checkpoint_dir /app/output/flashvsr_distributed/{video_dir_name} \
+    # 检查状态和恢复（使用恢复工具，checkpoint 目录见启动日志 [Main] Checkpoint directory: ...）
+    python tools/recover_distributed_inference.py \
+        --checkpoint_dir /app/tmp/checkpoints/{输出名} \
         --status
     
     # 合并部分结果（即使有些 rank 失败）
-    python recover_distributed_inference.py \
-        --checkpoint_dir /app/output/flashvsr_distributed/{video_dir_name} \
+    python tools/recover_distributed_inference.py \
+        --checkpoint_dir /app/tmp/checkpoints/{输出名} \
         --merge_partial \
         --output output_partial.mp4 \
         --fps 30.0
@@ -78,19 +93,49 @@ FlashVSR 分布式推理脚本
 - Canvas 使用内存映射文件存储，避免内存不足（支持16K-32K视频）
 - 每个 tile 处理完立即写入磁盘，即使中断也不会丢失已处理的数据
 - 支持断点续跑：重新运行相同命令会自动从断点恢复
-- 内存映射文件保存在 checkpoint_dir 中，可用于恢复和调试
+- 权重/checkpoint 默认存放在 /app/tmp/checkpoints/{输出文件名或文件夹名}/（容器内，宿主机可挂载），命名随 --output 自动推断，无需额外参数；启动时在日志中输出
 - 使用 --cleanup_mmap true 可以在保存结果后删除内存映射文件以节省空间
 
 恢复工具：
 - 使用 recover_distributed_inference.py 检查任务状态
 - 可以合并部分结果（即使有些 rank 失败）
 - 支持手动恢复失败的 rank
+- checkpoint 目录示例：--output test16K-32K 且 output_mode=pictures 时，为 /app/tmp/checkpoints/test16K-32K/
+
+HDR 支持（v3）：
+- 使用 --hdr_mode 启用 HDR 模式：完整的 HDR 输入到输出闭环
+- 输入支持：
+  * 10-bit DPX 图片序列：自动检测 .dpx 文件，使用 FFmpeg 读取，保持 HDR 信息（值 > 1.0）
+  * HDR 视频（H.265/HEVC with HDR10/HLG）：使用 FFmpeg 读取，保持 HDR 信息
+- 处理流程：
+  * HDR 输入（值可能 > 1.0）→ 自动检测 → Tone Mapping 压缩高光到 SDR [0, 1]
+  * 模型在 SDR 范围内正常超分
+  * Inverse Tone Mapping 还原 HDR 高光信息（值可能 > 1.0）
+  * 输出 10-bit DPX（保留 HDR 信息）
+- 推荐参数：
+  * --hdr_mode：启用 HDR 模式（完整的 HDR 闭环）
+  * --tone_mapping_method：选择算法（logarithmic/reinhard/aces），默认 logarithmic（完全可逆）
+  * --tone_mapping_exposure：曝光调整（默认 1.0，> 1.0 提亮，< 1.0 压暗）
+  * --output_format dpx10：输出 10-bit DPX（支持 HDR，保留高光信息）
+- 注意：
+  * HDR 模式会自动检测输入格式（DPX 或 HDR 视频），使用专门的 HDR 读取方式
+  * 如果输入不是 HDR 格式，会自动回退到普通读取方式
+  * Tone Mapping 参数保存在 checkpoint 目录，可用于恢复和调试
+  * PNG 输出不支持 HDR，会 clip 到 [0, 1] 并给出警告
+  * 视频输出（H.264）不支持 HDR，会 clip 并给出警告，建议使用 DPX 图像序列
+- 完整工作流程：HDR 输入（DPX/HDR视频）→ HDR读取（保持>1.0）→ Tone Mapping → 超分（SDR）→ Inverse Tone Mapping → HDR输出（DPX）
 """
 
 import os
 import sys
 import math
 import argparse
+
+# 添加项目根目录到 sys.path，确保可以导入 utils 模块
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -111,13 +156,23 @@ from einops import rearrange
 from typing import List, Tuple, Optional
 import uuid
 import time
-import hashlib
 import json
 import glob
 import gc
 import shutil
 import tempfile
 import numpy as np
+
+# HDR Tone Mapping 支持
+try:
+    from utils.hdr.tone_mapping import (
+        detect_hdr_range,
+        apply_tone_mapping_to_frames,
+        apply_inverse_tone_mapping_to_frames
+    )
+    HDR_TONE_MAPPING_AVAILABLE = True
+except ImportError:
+    HDR_TONE_MAPPING_AVAILABLE = False
 
 # 将项目根目录添加到 sys.path
 _project_root = os.path.dirname(os.path.abspath(__file__))
@@ -411,10 +466,15 @@ def create_feather_mask(size, overlap):
     
     return mask
 
-def get_total_frame_count(input_path: str) -> int:
-    """获取输入的总帧数（不加载所有帧到内存）。"""
+def get_total_frame_count(input_path: str, hdr_mode: bool = False) -> int:
+    """获取输入的总帧数（不加载所有帧到内存）。
+    
+    Args:
+        input_path: 输入路径
+        hdr_mode: 是否启用 HDR 模式
+    """
     if os.path.isfile(input_path):
-        # 视频文件：使用 OpenCV 获取帧数
+        # 视频文件：使用 OpenCV 获取帧数（HDR 和非 HDR 都支持）
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             raise RuntimeError(f"Failed to open video: {input_path}")
@@ -424,6 +484,10 @@ def get_total_frame_count(input_path: str) -> int:
     elif os.path.isdir(input_path):
         # 图片序列：统计图片文件数量
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+        if hdr_mode:
+            # HDR 模式：也支持 .dpx 文件
+            image_extensions.add('.dpx')
+        
         image_files = []
         for filename in os.listdir(input_path):
             if any(filename.lower().endswith(ext) for ext in image_extensions):
@@ -433,7 +497,7 @@ def get_total_frame_count(input_path: str) -> int:
     else:
         raise RuntimeError(f"Input path does not exist: {input_path}")
 
-def read_input_frames_range(input_path: str, start_idx: int, end_idx: int, fps: float = 30.0) -> Tuple[torch.Tensor, float]:
+def read_input_frames_range(input_path: str, start_idx: int, end_idx: int, fps: float = 30.0, hdr_mode: bool = False) -> Tuple[torch.Tensor, float]:
     """读取指定范围的帧（流式读取，避免一次性加载所有帧）。
     
     Args:
@@ -441,10 +505,67 @@ def read_input_frames_range(input_path: str, start_idx: int, end_idx: int, fps: 
         start_idx: 起始帧索引（包含）
         end_idx: 结束帧索引（不包含）
         fps: 帧率（用于图片序列）
+        hdr_mode: 是否启用 HDR 模式（如果 True，使用 HDR 读取方式，保持 HDR 信息）
     
     Returns:
         (frames_tensor, fps): 帧 tensor (N, H, W, C) 和 fps
+        - HDR 模式：值可能 > 1.0（保持 HDR 信息）
+        - 非 HDR 模式：值在 [0, 1] 范围内
     """
+    # HDR 模式：使用专门的 HDR 读取函数
+    if hdr_mode:
+        try:
+            from utils.io.hdr_io import read_dpx_frame, read_hdr_video_frame_range, detect_hdr_input
+            
+            if os.path.isfile(input_path):
+                # HDR 视频：使用 FFmpeg 读取，保持 HDR 信息
+                log(f"[read_input_frames_range] [HDR] 检测到视频文件，使用 HDR 读取方式...", "info", 0)
+                frames_np, fps = read_hdr_video_frame_range(input_path, start_idx, end_idx)
+                frames_tensor = torch.from_numpy(frames_np).float()
+                log(f"[read_input_frames_range] [HDR] 读取完成，范围: [{frames_tensor.min():.4f}, {frames_tensor.max():.4f}]", "info", 0)
+                return frames_tensor, fps
+                
+            elif os.path.isdir(input_path):
+                # 检查是否有 DPX 文件
+                files = os.listdir(input_path)
+                dpx_files = [f for f in files if f.lower().endswith('.dpx')]
+                
+                if len(dpx_files) > 0:
+                    # DPX 图片序列：使用 FFmpeg 读取，保持 HDR 信息
+                    log(f"[read_input_frames_range] [HDR] 检测到 DPX 图片序列，使用 HDR 读取方式...", "info", 0)
+                    dpx_files.sort(key=lambda x: natural_sort_key(x))
+                    
+                    if end_idx > len(dpx_files):
+                        end_idx = len(dpx_files)
+                    if start_idx >= len(dpx_files):
+                        raise RuntimeError(f"Start index {start_idx} exceeds total frames {len(dpx_files)}")
+                    
+                    frames = []
+                    for idx in range(start_idx, end_idx):
+                        dpx_path = os.path.join(input_path, dpx_files[idx])
+                        try:
+                            frame_np = read_dpx_frame(dpx_path)
+                            frame_tensor = torch.from_numpy(frame_np).float()
+                            frames.append(frame_tensor)
+                        except Exception as e:
+                            log(f"[read_input_frames_range] [HDR] Warning: Error reading {dpx_path}: {e}, skipping", "warning", 0)
+                            continue
+                    
+                    if not frames:
+                        raise RuntimeError(f"No valid DPX frames read from range {start_idx}-{end_idx}")
+                    
+                    video_tensor = torch.stack(frames, dim=0)
+                    log(f"[read_input_frames_range] [HDR] 读取完成，范围: [{video_tensor.min():.4f}, {video_tensor.max():.4f}]", "info", 0)
+                    return video_tensor, fps
+                else:
+                    # 没有 DPX 文件，回退到普通读取方式
+                    log(f"[read_input_frames_range] [HDR] 未检测到 DPX 文件，使用普通读取方式（可能丢失 HDR 信息）", "warning", 0)
+        except ImportError:
+            log(f"[read_input_frames_range] [HDR] Warning: read_hdr_input 模块不可用，回退到普通读取方式", "warning", 0)
+        except Exception as e:
+            log(f"[read_input_frames_range] [HDR] Warning: HDR 读取失败: {e}，回退到普通读取方式", "warning", 0)
+    
+    # 非 HDR 模式或 HDR 读取失败：使用普通读取方式
     if os.path.isfile(input_path):
         # 视频文件：读取指定范围的帧
         cap = cv2.VideoCapture(input_path)
@@ -774,17 +895,75 @@ def get_default_output_path(input_path: str, scale: int = 4) -> str:
         # Fallback
         return "output.mp4"
 
-def save_video(frames: torch.Tensor, output_path: str, fps: float = 30.0):
+def serialize_tone_mapping_params(params_list: list) -> list:
+    """序列化 tone mapping 参数（将 torch/numpy 类型转换为 Python 原生类型）"""
+    serialized = []
+    for params in params_list:
+        serialized_params = {}
+        for key, value in params.items():
+            if isinstance(value, torch.Tensor):
+                serialized_params[key] = value.item() if value.numel() == 1 else value.cpu().numpy().tolist()
+            elif isinstance(value, np.ndarray):
+                serialized_params[key] = value.tolist()
+            elif isinstance(value, (np.integer, np.floating)):
+                serialized_params[key] = float(value) if isinstance(value, np.floating) else int(value)
+            else:
+                serialized_params[key] = value
+        serialized.append(serialized_params)
+    return serialized
+
+
+def deserialize_tone_mapping_params(serialized_list: list) -> list:
+    """反序列化 tone mapping 参数（保持为 dict，不需要转回 torch）"""
+    # 参数已经是 Python 原生类型，直接返回即可
+    return serialized_list
+
+
+def get_checkpoint_dir(args) -> str:
+    """返回本次推理的 checkpoint 目录，默认 /app/tmp/checkpoints/{输出名}。
+    
+    输出名规则：取自 --output 或默认输出路径的「文件名」（视频时为无扩展名，图片序列时为目录名）。
+    例如：--output test16K-32K 且 output_mode=pictures → /app/tmp/checkpoints/test16K-32K/
+    例如：--output out.mp4 → /app/tmp/checkpoints/out/
+    """
+    output_path = args.output if args.output else get_default_output_path(args.input, args.scale)
+    output_path = output_path.rstrip(os.sep)
+    output_mode = getattr(args, 'output_mode', 'video')
+    if output_mode == 'pictures':
+        name = os.path.basename(output_path) or "output"
+    else:
+        name = os.path.splitext(os.path.basename(output_path))[0] or "output"
+    return os.path.join("/app/tmp/checkpoints", name)
+
+def save_video(frames: torch.Tensor, output_path: str, fps: float = 30.0, hdr_mode: bool = False):
     """Save video tensor to file using FFmpeg (with robust error handling).
     
     如果 FFmpeg pipe 方法失败，会自动回退到临时文件方法。
+    
+    Args:
+        frames: 视频帧 tensor (F, H, W, C)，可能是 HDR（值 > 1）
+        output_path: 输出路径
+        fps: 帧率
+        hdr_mode: 是否启用 HDR 模式（如果 True，不 clamp，但当前 H.264 编码不支持 HDR）
     """
     import subprocess
     import tempfile
     import os
     
     F, H, W, C = frames.shape
-    frames_np = (frames.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
+    
+    # HDR 模式：检查是否包含 HDR 值
+    is_hdr = hdr_mode and (frames > 1.0).any().item()
+    if is_hdr:
+        # 警告：当前 H.264 编码不支持 HDR，会丢失高光信息
+        print(f"[WARNING] HDR 模式：检测到 HDR 值 [{frames.min():.4f}, {frames.max():.4f}]，但 H.264 编码不支持 HDR。")
+        print(f"[WARNING] 建议使用 --output_mode pictures --output_format dpx10 输出 HDR 图像序列。")
+        print(f"[WARNING] 视频输出将 clip 到 [0, 1]，会丢失高光信息。")
+        # 对于视频输出，必须 clip（H.264 不支持 HDR）
+        frames_np = (frames.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
+    else:
+        # SDR 模式：正常处理
+        frames_np = (frames.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
     
     # 方法1：尝试使用 pipe（快速，但可能遇到 BrokenPipeError）
     try:
@@ -914,7 +1093,7 @@ def init_pipeline_distributed(rank: int, world_size: int, mode: str, dtype: torc
     vae_path = os.path.join(model_path, "Wan2.1_VAE.pth")
     lq_path = os.path.join(model_path, "LQ_proj_in.ckpt")
     tcd_path = os.path.join(model_path, "TCDecoder.ckpt")
-    prompt_path = os.path.join(_project_root, "posi_prompt.pth")
+    prompt_path = os.path.join(_project_root, "data", "posi_prompt.pth")
     
     # 验证文件存在
     required_files = [ckpt_path]
@@ -1090,8 +1269,34 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
     
     # 读取所有帧（单 GPU 模式可以一次性加载）
     log(f"[Single-GPU] Reading all {total_frames} frames...", "info")
-    segment_frames = read_input_frames_range(args.input, 0, total_frames, fps=input_fps)[0]
+    hdr_mode = getattr(args, 'hdr_mode', False)
+    segment_frames = read_input_frames_range(args.input, 0, total_frames, fps=input_fps, hdr_mode=hdr_mode)[0]
     log(f"[Single-GPU] Loaded {segment_frames.shape[0]} frames, shape: {segment_frames.shape}", "info")
+    
+    # HDR 模式：检测 HDR 并应用 Tone Mapping
+    tone_mapping_params = None
+    if getattr(args, 'hdr_mode', False) and HDR_TONE_MAPPING_AVAILABLE:
+        if detect_hdr_range(segment_frames):
+            log(f"[Single-GPU] [HDR] 检测到 HDR 输入，应用 Tone Mapping ({args.tone_mapping_method})...", "info")
+            log(f"[Single-GPU] [HDR] 原始范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info")
+            segment_frames, tone_mapping_params = apply_tone_mapping_to_frames(
+                segment_frames,
+                method=args.tone_mapping_method,
+                exposure=args.tone_mapping_exposure,
+                per_frame=True
+            )
+            log(f"[Single-GPU] [HDR] Tone Mapping 完成，SDR 范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info")
+            
+            # 保存参数到 checkpoint_dir
+            checkpoint_dir = args.checkpoint_dir
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            params_file = os.path.join(checkpoint_dir, "rank_0_tone_mapping_params.json")
+            serialized_params = serialize_tone_mapping_params(tone_mapping_params)
+            with open(params_file, 'w') as f:
+                json.dump(serialized_params, f, indent=2)
+            log(f"[Single-GPU] [HDR] Tone Mapping 参数已保存: {params_file}", "info")
+        else:
+            log(f"[Single-GPU] [HDR] 未检测到 HDR 值（所有值 <= 1.0），跳过 Tone Mapping", "info")
     
     # 验证帧数
     if segment_frames.shape[0] < 21:
@@ -1103,10 +1308,18 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
     output = run_inference_distributed_segment(pipe, segment_frames, device_str, dtype, args, rank=0, checkpoint_dir=None)
     log(f"[Single-GPU] ✓ Inference completed, output shape: {output.shape}", "info")
     
-    # 保存结果到临时目录（与分布式模式保持一致）
-    video_dir_name = f"{hashlib.md5(args.input.encode()).hexdigest()}_{args.scale}x"
-    temp_base = getattr(args, 'temp_base', '/app/output')
-    checkpoint_dir = os.path.join(temp_base, 'flashvsr_distributed', video_dir_name)
+    # HDR 模式：应用 Inverse Tone Mapping 还原 HDR
+    if getattr(args, 'hdr_mode', False) and HDR_TONE_MAPPING_AVAILABLE and tone_mapping_params is not None:
+        log(f"[Single-GPU] [HDR] 应用 Inverse Tone Mapping 还原 HDR...", "info")
+        log(f"[Single-GPU] [HDR] 超分输出范围: [{output.min():.4f}, {output.max():.4f}]", "info")
+        # 确保 output 在 [0, 1] 范围内（如果是从 [-1, 1] 转换来的）
+        if output.min() < 0:
+            output = (output + 1.0) / 2.0
+        output = apply_inverse_tone_mapping_to_frames(output, tone_mapping_params)
+        log(f"[Single-GPU] [HDR] HDR 还原完成，范围: [{output.min():.4f}, {output.max():.4f}]", "info")
+    
+    # 保存结果到 checkpoint 目录（/app/tmp/checkpoints/{输出名}）
+    checkpoint_dir = args.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     output_file = os.path.join(checkpoint_dir, "rank_0_result.pt")
@@ -1127,18 +1340,55 @@ def run_single_gpu_inference(args, total_frames: int, input_fps: float, device_i
     output_path = args.output if args.output else get_default_output_path(args.input, args.scale)
     
     if output_mode == "pictures":
-        log(f"[Single-GPU] Saving frames to {output_path} (image sequence mode)...", "info")
+        output_format = getattr(args, 'output_format', 'png')
+        log(f"[Single-GPU] Saving frames to {output_path} (image sequence, format={output_format})...", "info")
         os.makedirs(output_path, exist_ok=True)
-        output_np = (output.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-        for frame_idx in range(output_np.shape[0]):
-            frame = output_np[frame_idx]
-            frame_filename = os.path.join(output_path, f"frame_{frame_idx:06d}.png")
-            cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        log(f"[Single-GPU] ✓ Saved {output_np.shape[0]} frames to {output_path}", "finish")
+        if output_format == "dpx10":
+            from utils.io.video_io import save_frame_as_dpx10
+            # 检查是否是 HDR（如果启用了 hdr_mode，output 可能包含 > 1 的值）
+            is_hdr = getattr(args, 'hdr_mode', False) and (output > 1.0).any().item()
+            if is_hdr:
+                log(f"[Single-GPU] [HDR] 输出包含 HDR 值，范围: [{output.min():.4f}, {output.max():.4f}]", "info")
+                # 获取全局 HDR 最大值（从 Tone Mapping 参数中，或使用输出最大值）
+                global_hdr_max = output.max().item()
+                # 尝试从保存的参数文件中读取全局最大值
+                checkpoint_dir = args.checkpoint_dir
+                params_file = os.path.join(checkpoint_dir, "rank_0_tone_mapping_params.json")
+                if os.path.exists(params_file):
+                    try:
+                        with open(params_file, 'r') as f:
+                            params_list = json.load(f)
+                        # 获取所有帧的最大 HDR 值
+                        if params_list and len(params_list) > 0:
+                            max_hdr_values = [p.get('max_hdr', 1.0) for p in params_list]
+                            global_hdr_max = max(max_hdr_values) if max_hdr_values else global_hdr_max
+                            log(f"[Single-GPU] [HDR] 使用全局 HDR 最大值: {global_hdr_max:.4f}（保留绝对亮度关系）", "info")
+                    except:
+                        pass
+            else:
+                global_hdr_max = None
+            
+            for frame_idx in range(output.shape[0]):
+                frame = output[frame_idx].cpu().numpy()  # (H,W,3) float，可能是 HDR
+                # 使用全局 HDR 最大值归一化（保留绝对亮度关系）
+                frame_filename = os.path.join(output_path, f"frame_{frame_idx:06d}.dpx")
+                save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max)
+            log(f"[Single-GPU] ✓ Saved {output.shape[0]} frames as 10-bit DPX to {output_path}", "finish")
+        else:
+            # PNG 输出：如果启用了 hdr_mode 且包含 HDR 值，需要 clip（PNG 不支持 HDR）
+            is_hdr = getattr(args, 'hdr_mode', False) and (output > 1.0).any().item()
+            if is_hdr:
+                log(f"[Single-GPU] [HDR] 输出包含 HDR 值，PNG 输出会 clip 到 [0,1]（会丢失高光）", "warning")
+            output_np = (output.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
+            for frame_idx in range(output_np.shape[0]):
+                frame = output_np[frame_idx]
+                frame_filename = os.path.join(output_path, f"frame_{frame_idx:06d}.png")
+                cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            log(f"[Single-GPU] ✓ Saved {output_np.shape[0]} frames as PNG to {output_path}", "finish")
     else:
         log(f"[Single-GPU] Saving video to {output_path}...", "info")
-        from save_recovered_video import save_video
-        save_video(output, output_path, input_fps)
+        from utils.io.video_io import save_video
+        save_video(output, output_path, input_fps, hdr_mode=getattr(args, 'hdr_mode', False))
         log(f"[Single-GPU] ✓ Video saved: {output_path}", "finish")
     
     log(f"[Single-GPU] ✓ All steps completed!", "finish")
@@ -1601,9 +1851,7 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
         if rank >= actual_num_segments:
             log(f"[Rank {rank}] No segment assigned (video too short, only {actual_num_segments} segments for {world_size} ranks). Exiting gracefully.", "info", rank)
             # 创建一个空的结果文件，标记为完成
-            video_dir_name = f"{hashlib.md5(args.input.encode()).hexdigest()}_{args.scale}x"
-            temp_base = getattr(args, 'temp_base', '/app/output')
-            checkpoint_dir = os.path.join(temp_base, 'flashvsr_distributed', video_dir_name)
+            checkpoint_dir = args.checkpoint_dir
             os.makedirs(checkpoint_dir, exist_ok=True)
             done_file = os.path.join(checkpoint_dir, f"rank_{rank}_done.flag")
             with open(done_file, 'w') as f:
@@ -1618,8 +1866,34 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
         # 流式读取：只读取当前 rank 负责的帧段
         log(f"[Rank {rank}] [Step 1/4] Reading frames {start_idx}-{end_idx} from input...", "info", rank)
         input_fps_for_read = getattr(args, 'fps', 30.0)
-        segment_frames = read_input_frames_range(args.input, start_idx, end_idx, fps=input_fps_for_read)[0]
+        hdr_mode = getattr(args, 'hdr_mode', False)
+        segment_frames = read_input_frames_range(args.input, start_idx, end_idx, fps=input_fps_for_read, hdr_mode=hdr_mode)[0]
         log(f"[Rank {rank}] [Step 1/4] ✓ Loaded {segment_frames.shape[0]} frames, shape: {segment_frames.shape}", "info", rank)
+        
+        # HDR 模式：检测 HDR 并应用 Tone Mapping
+        tone_mapping_params = None
+        if getattr(args, 'hdr_mode', False) and HDR_TONE_MAPPING_AVAILABLE:
+            if detect_hdr_range(segment_frames):
+                log(f"[Rank {rank}] [HDR] 检测到 HDR 输入，应用 Tone Mapping ({args.tone_mapping_method})...", "info", rank)
+                log(f"[Rank {rank}] [HDR] 原始范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info", rank)
+                segment_frames, tone_mapping_params = apply_tone_mapping_to_frames(
+                    segment_frames,
+                    method=args.tone_mapping_method,
+                    exposure=args.tone_mapping_exposure,
+                    per_frame=True
+                )
+                log(f"[Rank {rank}] [HDR] Tone Mapping 完成，SDR 范围: [{segment_frames.min():.4f}, {segment_frames.max():.4f}]", "info", rank)
+                
+                # 保存参数到 checkpoint_dir
+                checkpoint_dir = args.checkpoint_dir
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                params_file = os.path.join(checkpoint_dir, f"rank_{rank}_tone_mapping_params.json")
+                serialized_params = serialize_tone_mapping_params(tone_mapping_params)
+                with open(params_file, 'w') as f:
+                    json.dump(serialized_params, f, indent=2)
+                log(f"[Rank {rank}] [HDR] Tone Mapping 参数已保存: {params_file}", "info", rank)
+            else:
+                log(f"[Rank {rank}] [HDR] 未检测到 HDR 值（所有值 <= 1.0），跳过 Tone Mapping", "info", rank)
         
         # 验证 segment 帧数
         if segment_frames.shape[0] < 21:
@@ -1629,10 +1903,8 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
         
         log(f"[Rank {rank}] [Step 2/4] Segment info: frames {start_idx}-{end_idx} ({segment_frames.shape[0]} frames), resolution: {segment_frames.shape[1]}x{segment_frames.shape[2]}", "info", rank)
         
-        # 保存结果到临时文件
-        video_dir_name = f"{hashlib.md5(args.input.encode()).hexdigest()}_{args.scale}x"
-        temp_base = getattr(args, 'temp_base', '/app/output')
-        checkpoint_dir = os.path.join(temp_base, 'flashvsr_distributed', video_dir_name)
+        # 保存结果到 checkpoint 目录（/app/tmp/checkpoints/{输出名}）
+        checkpoint_dir = args.checkpoint_dir
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         output_file = os.path.join(checkpoint_dir, f"rank_{rank}_result.pt")
@@ -1643,6 +1915,16 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
         try:
             segment_output = run_inference_distributed_segment(pipe, segment_frames, device, dtype, args, rank, checkpoint_dir)
             log(f"[Rank {rank}] [Step 3/4] ✓ Inference completed, output shape: {segment_output.shape}", "info", rank)
+            
+            # HDR 模式：应用 Inverse Tone Mapping 还原 HDR
+            if getattr(args, 'hdr_mode', False) and HDR_TONE_MAPPING_AVAILABLE and tone_mapping_params is not None:
+                log(f"[Rank {rank}] [HDR] 应用 Inverse Tone Mapping 还原 HDR...", "info", rank)
+                log(f"[Rank {rank}] [HDR] 超分输出范围: [{segment_output.min():.4f}, {segment_output.max():.4f}]", "info", rank)
+                # 确保 output 在 [0, 1] 范围内（如果是从 [-1, 1] 转换来的）
+                if segment_output.min() < 0:
+                    segment_output = (segment_output + 1.0) / 2.0
+                segment_output = apply_inverse_tone_mapping_to_frames(segment_output, tone_mapping_params)
+                log(f"[Rank {rank}] [HDR] HDR 还原完成，范围: [{segment_output.min():.4f}, {segment_output.max():.4f}]", "info", rank)
             
             # 处理overlap：裁剪重叠部分（除了第一个和最后一个segment）
             # 注意：由于 prepare_input_tensor 可能会减少帧数，我们需要根据实际输出帧数来处理overlap
@@ -1855,7 +2137,7 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                 log(f"[Rank 0] Saving final video to {output_path} (streaming mode)...", "info", rank)
             
             # 使用流式保存方法（分批加载和写入）
-            from save_recovered_video import save_video_streaming
+            from utils.io.video_io import save_video_streaming
             
             # 创建流式写入器
             tmp_yuv_path = None  # 在外层定义，确保在所有异常处理中可见
@@ -1878,13 +2160,16 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                 # 根据输出模式选择不同的处理方式
                 if output_mode == "pictures":
                     # 序列帧模式：直接输出为图像序列，无需临时文件
-                    log(f"[Rank 0] Output mode: image sequence (pictures)", "info", rank)
+                    output_format = getattr(args, 'output_format', 'png')
+                    log(f"[Rank 0] Output mode: image sequence (pictures), format={output_format}", "info", rank)
                     log(f"[Rank 0] Creating output directory: {output_path}", "info", rank)
                     
                     # 确保输出目录存在
                     os.makedirs(output_path, exist_ok=True)
                     
                     total_frames_written = 0
+                    if output_format == "dpx10":
+                        from utils.io.video_io import save_frame_as_dpx10
                     
                     # 流式处理每个 rank 的结果，直接保存为图像序列
                     log(f"[Rank 0] [Streaming] Processing {len(result_files)} rank results and saving as image sequence (CPU memory only)...", "info", rank)
@@ -1899,25 +2184,73 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                         segment_frames = segment.shape[0]
                         log(f"[Rank 0] [Streaming]   - ✓ Loaded {segment_frames} frames, shape: {segment.shape}", "success", rank)
                         
-                        # 转换为 numpy 并逐帧保存
-                        log(f"[Rank 0] [Streaming]   - Converting to numpy and saving as images...", "info", rank)
-                        segment_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-                        
-                        frames_in_rank = 0
-                        for frame_idx in range(segment_np.shape[0]):
-                            frame = segment_np[frame_idx]  # [H, W, C]
-                            # 保存为 PNG 格式（支持无损压缩）
-                            frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
-                            cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                            frames_in_rank += 1
-                            total_frames_written += 1
+                        if output_format == "dpx10":
+                            log(f"[Rank 0] [Streaming]   - Saving as 10-bit DPX...", "info", rank)
+                            # 检查是否是 HDR（如果启用了 hdr_mode，segment 可能包含 > 1 的值）
+                            is_hdr = getattr(args, 'hdr_mode', False) and (segment > 1.0).any().item()
+                            if is_hdr:
+                                log(f"[Rank 0] [Streaming]   - 检测到 HDR 值，范围: [{segment.min():.4f}, {segment.max():.4f}]", "info", rank)
+                                # 获取全局 HDR 最大值（从所有 rank 的参数文件中）
+                                global_hdr_max = segment.max().item()
+                                checkpoint_dir = args.checkpoint_dir
+                                # 尝试从所有 rank 的参数文件中读取全局最大值
+                                # 从 result_files 中获取实际的 rank 列表
+                                rank_list = [r for r, _, _ in result_files]
+                                for r in rank_list:
+                                    params_file = os.path.join(checkpoint_dir, f"rank_{r}_tone_mapping_params.json")
+                                    if os.path.exists(params_file):
+                                        try:
+                                            with open(params_file, 'r') as f:
+                                                params_list = json.load(f)
+                                            if params_list and len(params_list) > 0:
+                                                max_hdr_values = [p.get('max_hdr', 1.0) for p in params_list]
+                                                rank_max = max(max_hdr_values) if max_hdr_values else 1.0
+                                                global_hdr_max = max(global_hdr_max, rank_max)
+                                        except:
+                                            pass
+                                log(f"[Rank 0] [Streaming]   - 使用全局 HDR 最大值: {global_hdr_max:.4f}（保留绝对亮度关系）", "info", rank)
+                            else:
+                                global_hdr_max = None
                             
-                            # 每处理50帧打印一次进度
-                            if frames_in_rank % 50 == 0 or frames_in_rank == segment_np.shape[0]:
-                                log(f"[Rank 0] [Streaming]   - Saved {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info", rank)
+                            frames_in_rank = 0
+                            for frame_idx in range(segment.shape[0]):
+                                frame = segment[frame_idx].cpu().numpy()  # (H,W,3) float，可能是 HDR
+                                # 对于 HDR，不 clamp；对于 SDR，确保在 [0, 1]
+                                if not is_hdr:
+                                    frame = np.clip(frame, 0, 1)
+                                frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
+                                # 使用全局 HDR 最大值归一化（保留绝对亮度关系）
+                                save_frame_as_dpx10(frame, frame_filename, hdr_max=global_hdr_max)
+                                frames_in_rank += 1
+                                total_frames_written += 1
+                                if frames_in_rank % 50 == 0 or frames_in_rank == segment.shape[0]:
+                                    log(f"[Rank 0] [Streaming]   - Saved {frames_in_rank}/{segment.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info", rank)
+                        else:
+                            log(f"[Rank 0] [Streaming]   - Converting to numpy and saving as PNG...", "info", rank)
+                            # 如果启用了 hdr_mode 且包含 HDR 值，需要 tone mapping 回 SDR（PNG 不支持 HDR）
+                            is_hdr = getattr(args, 'hdr_mode', False) and (segment > 1.0).any().item()
+                            if is_hdr:
+                                log(f"[Rank 0] [Streaming]   - 检测到 HDR 值，PNG 输出需要 tone mapping 回 SDR", "info", rank)
+                                # 简单处理：clip 到 [0, 1]（会丢失高光，但 PNG 不支持 HDR）
+                                # 或者可以应用简单的 tone mapping
+                                segment_clamped = segment.clamp(0, 1)
+                            else:
+                                segment_clamped = segment.clamp(0, 1)
+                            segment_np = (segment_clamped * 255).byte().cpu().numpy().astype('uint8')
+                            frames_in_rank = 0
+                            for frame_idx in range(segment_np.shape[0]):
+                                frame = segment_np[frame_idx]  # [H, W, C]
+                                frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
+                                cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                                frames_in_rank += 1
+                                total_frames_written += 1
+                                if frames_in_rank % 50 == 0 or frames_in_rank == segment_np.shape[0]:
+                                    log(f"[Rank 0] [Streaming]   - Saved {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info", rank)
                         
                         # 释放内存
-                        del segment, segment_np
+                        del segment
+                        if output_format != "dpx10":
+                            del segment_np
                         gc.collect()
                         
                         log(f"[Rank 0] [Streaming]   - ✓ Rank {r} completed. Total frames saved: {total_frames_written}", "success", rank)
@@ -1931,10 +2264,11 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                     elif total_frames_written > total_frames:
                         log(f"[Rank 0] WARNING: Saved {total_frames_written} frames > target {total_frames}. May have extra frames.", "warning", rank)
                     
+                    fmt_desc = "10-bit DPX (frame_XXXXXX.dpx)" if output_format == "dpx10" else "PNG (frame_XXXXXX.png)"
                     log(f"[Rank 0] ✓ Image sequence saved successfully: {output_path}", "finish", rank)
                     log(f"[Rank 0]   - Total frames: {total_frames_written}", "finish", rank)
                     log(f"[Rank 0]   - Image dimensions: {H}x{W}x{C}", "finish", rank)
-                    log(f"[Rank 0]   - Frame format: PNG (frame_XXXXXX.png)", "finish", rank)
+                    log(f"[Rank 0]   - Frame format: {fmt_desc}", "finish", rank)
                     
                 else:
                     # 视频模式：使用临时文件方式（更稳定，避免 BrokenPipeError，特别适合16K视频）
@@ -1963,6 +2297,12 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                             
                             # 转换为 numpy 并分批写入临时文件
                             log(f"[Rank 0] [Streaming]   - Converting to numpy and writing to temp file...", "info", rank)
+                            # 检查是否是 HDR（如果启用了 hdr_mode，segment 可能包含 > 1 的值）
+                            is_hdr = getattr(args, 'hdr_mode', False) and (segment > 1.0).any().item()
+                            if is_hdr:
+                                log(f"[Rank 0] [Streaming]   - 检测到 HDR 值，范围: [{segment.min():.4f}, {segment.max():.4f}]", "info", rank)
+                                log(f"[Rank 0] [Streaming]   - 警告：H.264 编码不支持 HDR，会 clip 到 [0, 1]，丢失高光信息", "warning", rank)
+                                log(f"[Rank 0] [Streaming]   - 建议使用 --output_mode pictures --output_format dpx10 输出 HDR", "info", rank)
                             segment_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
                             batch_size = 50  # 临时文件可以写入更多帧
                             
@@ -2085,17 +2425,13 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
                         log(f"[Rank 0] Merged frames ({merged.shape[0]}) > total frames ({total_frames}), cropping to {total_frames} frames", "info", rank)
                         merged = merged[:total_frames]
                 
-                save_video(merged, output_path, input_fps)
+                save_video(merged, output_path, input_fps, hdr_mode=getattr(args, 'hdr_mode', False))
             output_size_mb = os.path.getsize(output_path) / (1024**2) if os.path.exists(output_path) else 0
             log(f"[Rank 0] ✓ Final video saved: {output_path} ({output_size_mb:.2f} MB)", "finish", rank)
             log(f"[Rank 0] ==============================================", "finish", rank)
             
-            # 清理临时文件
-            try:
-                shutil.rmtree(checkpoint_dir)
-                log(f"[Rank 0] Cleaned up temporary files", "info", rank)
-            except:
-                pass
+            # 保留 checkpoint 目录（不自动删除），便于测试与调试
+            log(f"[Rank 0] Checkpoint directory preserved: {checkpoint_dir}", "info", rank)
         
     except Exception as e:
         # 记录错误，但不阻止其他 rank 继续运行
@@ -2104,9 +2440,7 @@ def run_distributed_inference(rank: int, world_size: int, args, total_frames: in
         log(f"[Rank {rank}] Traceback: {traceback.format_exc()}", "error", rank)
         # 尝试保存错误信息
         try:
-            video_dir_name = f"{hashlib.md5(args.input.encode()).hexdigest()}_{args.scale}x"
-            temp_base = getattr(args, 'temp_base', '/app/output')
-            checkpoint_dir = os.path.join(temp_base, 'flashvsr_distributed', video_dir_name)
+            checkpoint_dir = args.checkpoint_dir
             os.makedirs(checkpoint_dir, exist_ok=True)
             error_file = os.path.join(checkpoint_dir, f"rank_{rank}_fatal_error.txt")
             with open(error_file, 'w') as f:
@@ -2181,23 +2515,6 @@ def parse_devices(devices_str: str, total_gpus: int) -> List[int]:
     
     return device_indices
 
-def get_temp_dir(args) -> str:
-    """获取临时目录路径（优先使用用户指定或输出目录，避免 /tmp 空间不足）。"""
-    if args.temp_dir:
-        temp_base = args.temp_dir
-    elif args.output:
-        # 使用输出目录的父目录
-        temp_base = os.path.dirname(os.path.abspath(args.output))
-        if not temp_base or temp_base == '/':
-            temp_base = '/app/output'  # 回退到 /app/output
-    else:
-        # 默认使用 /app/output（通常有更多空间）
-        temp_base = '/app/output'
-    
-    # 确保目录存在
-    os.makedirs(temp_base, exist_ok=True)
-    return temp_base
-
 def main(args):
     """主函数：启动分布式推理。"""
     if not torch.cuda.is_available():
@@ -2222,13 +2539,14 @@ def main(args):
     log(f"[Main] Total available GPUs: {total_gpus}", "info")
     log(f"[Main] Selected GPUs: {device_indices} (using {world_size} GPUs)", "info")
     
-    # 设置临时目录（避免 /tmp 空间不足）
-    args.temp_base = get_temp_dir(args)
-    log(f"[Main] Using temporary directory: {args.temp_base}", "info")
+    # 设置 checkpoint 目录：/app/tmp/checkpoints/{输出文件名或文件夹名}，无需额外参数
+    args.checkpoint_dir = get_checkpoint_dir(args)
+    log(f"[Main] Checkpoint directory: {args.checkpoint_dir}", "info")
     
     # 获取总帧数（不加载所有帧到内存，避免序列化问题）
     log(f"[Main] Getting frame count from input: {args.input}", "info")
-    total_frames = get_total_frame_count(args.input)
+    hdr_mode = getattr(args, 'hdr_mode', False)
+    total_frames = get_total_frame_count(args.input, hdr_mode=hdr_mode)
     log(f"[Main] Total frames in input: {total_frames}", "info")
     
     # 应用 max_frames 限制（用于测试）
@@ -2356,6 +2674,15 @@ if __name__ == "__main__":
                        help="Output path: video file (if --output_mode=video) or directory (if --output_mode=pictures)")
     parser.add_argument("--output_mode", type=str, default="video", choices=["video", "pictures"],
                        help="Output mode: 'video' for video file (default), 'pictures' for image sequence")
+    parser.add_argument("--output_format", type=str, default="png", choices=["png", "dpx10"],
+                       help="When output_mode=pictures: 'png' (8-bit, default) or 'dpx10' (10-bit DPX). Ignored when output_mode=video.")
+    parser.add_argument("--hdr_mode", action="store_true",
+                       help="启用 HDR 模式：自动检测 HDR 输入，应用 Tone Mapping 压缩高光，超分后还原")
+    parser.add_argument("--tone_mapping_method", type=str, default="logarithmic",
+                       choices=["reinhard", "logarithmic", "aces"],
+                       help="Tone Mapping 方法（默认: logarithmic，完全可逆）")
+    parser.add_argument("--tone_mapping_exposure", type=float, default=1.0,
+                       help="Tone Mapping 曝光调整（默认: 1.0）")
     parser.add_argument("--fps", type=float, default=30.0,
                        help="Frames per second (used when input is image sequence, default: 30.0)")
     parser.add_argument("--model_ver", type=str, default="1.1", choices=["1.0", "1.1"], help="Model version")
@@ -2389,8 +2716,6 @@ if __name__ == "__main__":
                         help="Number of tiles to process simultaneously (0 = auto-detect based on GPU memory, default: 0)")
     parser.add_argument("--adaptive_tile_batch", type=lambda x: x.lower() in ['true', '1', 'yes'], default=True,
                         help="Enable adaptive tile batch size based on available GPU memory (default: True)")
-    parser.add_argument("--temp_dir", type=str, default=None,
-                       help="Temporary directory for intermediate files (default: output directory or /app/output)")
     parser.add_argument("--max_frames", type=int, default=None,
                        help="Maximum number of frames to process (for testing, e.g., 10 or 20 frames)")
     parser.add_argument("--devices", type=str, default=None,

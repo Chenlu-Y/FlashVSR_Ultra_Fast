@@ -23,16 +23,17 @@ import os
 import sys
 import argparse
 import json
+
+# 添加项目根目录到 sys.path，确保可以导入 utils 模块
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import torch
 import cv2
 from typing import List, Tuple, Optional
 import hashlib
 import tempfile
-
-# 将项目根目录添加到 sys.path
-_project_root = os.path.dirname(os.path.abspath(__file__))
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
 
 def log(message: str, message_type: str = 'normal'):
     """Colored logging for console output (with flush for real-time output)."""
@@ -165,7 +166,7 @@ def check_status(checkpoint_dir: str):
         if status['error']:
             log(f"  Error: {status.get('error_msg', 'Unknown error')[:200]}...", "error")
 
-def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: float = 30.0, world_size: int = 8, total_frames: int = None, output_mode: str = "video"):
+def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: float = 30.0, world_size: int = 8, total_frames: int = None, output_mode: str = "video", output_format: str = "png"):
     """流式合并部分结果（即使有些 rank 失败）。
     
     使用流式合并策略，逐个加载 rank 结果并直接写入视频，避免一次性加载所有到内存。
@@ -235,7 +236,7 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
         # 根据输出模式选择不同的处理方式
         if output_mode == "pictures":
             # 序列帧模式：直接输出为图像序列，无需临时文件
-            log(f"[Merge] [Step 2/2] Output mode: image sequence (pictures)", "info")
+            log(f"[Merge] [Step 2/2] Output mode: image sequence (pictures), format={output_format}", "info")
             log(f"[Merge] Creating output directory: {output_path}", "info")
             
             # 确保输出目录存在
@@ -243,6 +244,8 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
             
             total_frames_written = 0
             last_frame = None
+            if output_format == "dpx10":
+                from utils.io.video_io import save_frame_as_dpx10
             
             # 流式处理每个 rank 的结果，直接保存为图像序列
             log(f"[Merge] [Step 2/2] Processing {len(result_files)} rank results and saving as image sequence...", "info")
@@ -256,28 +259,36 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                 segment_frames = segment.shape[0]
                 log(f"[Merge]     - ✓ Loaded {segment_frames} frames, shape: {segment.shape}", "success")
                 
-                # 转换为 numpy 并逐帧保存
-                log(f"[Merge]     - Converting to numpy and saving as images...", "info")
-                segment_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
-                
-                frames_in_rank = 0
-                for frame_idx in range(segment_np.shape[0]):
-                    frame = segment_np[frame_idx]  # [H, W, C]
-                    # 保存为 PNG 格式（支持无损压缩）
-                    frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
-                    cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-                    frames_in_rank += 1
-                    total_frames_written += 1
-                    
-                    # 每处理50帧打印一次进度
-                    if frames_in_rank % 50 == 0 or frames_in_rank == segment_np.shape[0]:
-                        log(f"[Merge]     - Saved {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info")
-                
-                # 保存最后一帧（用于可能的填充）
                 last_frame = segment[-1:, :, :, :]
                 
+                if output_format == "dpx10":
+                    log(f"[Merge]     - Saving as 10-bit DPX...", "info")
+                    frames_in_rank = 0
+                    for frame_idx in range(segment.shape[0]):
+                        frame = segment[frame_idx].clamp(0, 1).cpu().numpy()
+                        frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
+                        save_frame_as_dpx10(frame, frame_filename)
+                        frames_in_rank += 1
+                        total_frames_written += 1
+                        if frames_in_rank % 50 == 0 or frames_in_rank == segment.shape[0]:
+                            log(f"[Merge]     - Saved {frames_in_rank}/{segment.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info")
+                else:
+                    log(f"[Merge]     - Converting to numpy and saving as PNG...", "info")
+                    segment_np = (segment.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
+                    frames_in_rank = 0
+                    for frame_idx in range(segment_np.shape[0]):
+                        frame = segment_np[frame_idx]
+                        frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
+                        cv2.imwrite(frame_filename, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                        frames_in_rank += 1
+                        total_frames_written += 1
+                        if frames_in_rank % 50 == 0 or frames_in_rank == segment_np.shape[0]:
+                            log(f"[Merge]     - Saved {frames_in_rank}/{segment_np.shape[0]} frames from Rank {r} (total: {total_frames_written} frames)", "info")
+                
                 # 释放内存
-                del segment, segment_np
+                del segment
+                if output_format != "dpx10":
+                    del segment_np
                 gc.collect()
                 
                 log(f"[Merge]     - ✓ Rank {r} completed. Total frames saved: {total_frames_written}", "success")
@@ -287,22 +298,32 @@ def merge_partial_results(checkpoint_dir: str, output_path: str, input_fps: floa
                 missing = total_frames - total_frames_written
                 log(f"[Merge] Padding {missing} frames using the last frame...", "info")
                 if last_frame is not None:
-                    padding_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')[0]  # [H, W, C]
-                    for i in range(missing):
-                        frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
-                        cv2.imwrite(frame_filename, cv2.cvtColor(padding_np, cv2.COLOR_RGB2BGR))
-                        total_frames_written += 1
-                        if (i + 1) % 10 == 0:
-                            log(f"[Merge]   Padded {i + 1}/{missing} frames...", "info")
+                    if output_format == "dpx10":
+                        pad_np = last_frame.clamp(0, 1).cpu().numpy()[0]
+                        for i in range(missing):
+                            frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.dpx")
+                            save_frame_as_dpx10(pad_np, frame_filename)
+                            total_frames_written += 1
+                            if (i + 1) % 10 == 0:
+                                log(f"[Merge]   Padded {i + 1}/{missing} frames...", "info")
+                    else:
+                        padding_np = (last_frame.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')[0]
+                        for i in range(missing):
+                            frame_filename = os.path.join(output_path, f"frame_{total_frames_written:06d}.png")
+                            cv2.imwrite(frame_filename, cv2.cvtColor(padding_np, cv2.COLOR_RGB2BGR))
+                            total_frames_written += 1
+                            if (i + 1) % 10 == 0:
+                                log(f"[Merge]   Padded {i + 1}/{missing} frames...", "info")
                 log(f"[Merge] ✓ Padded to {total_frames_written} frames (target: {total_frames})", "success")
             elif total_frames is not None and total_frames_written > total_frames:
                 log(f"[Merge] WARNING: Saved {total_frames_written} frames > target {total_frames}. May have extra frames.", "warning")
             
+            fmt_desc = "10-bit DPX (frame_XXXXXX.dpx)" if output_format == "dpx10" else "PNG (frame_XXXXXX.png)"
             log(f"\n========== Merge Completed Successfully ==========", "finish")
             log(f"Output directory: {output_path}", "finish")
             log(f"Total frames: {total_frames_written}", "finish")
             log(f"Image dimensions: {H}x{W}x{C}", "finish")
-            log(f"Frame format: PNG (frame_XXXXXX.png)", "finish")
+            log(f"Frame format: {fmt_desc}", "finish")
             log(f"=============================================", "finish")
             
         else:
@@ -480,6 +501,8 @@ def main():
                         help="Recover a specific rank (shows instructions)")
     parser.add_argument("--output_mode", type=str, default="video", choices=["video", "pictures"],
                         help="Output mode: 'video' for video file (default), 'pictures' for image sequence")
+    parser.add_argument("--output_format", type=str, default="png", choices=["png", "dpx10"],
+                        help="When output_mode=pictures: 'png' (default) or 'dpx10' (10-bit DPX). Ignored when output_mode=video.")
     
     args = parser.parse_args()
     
@@ -489,7 +512,7 @@ def main():
         if not args.output:
             log("ERROR: --output is required for --merge_partial", "error")
             return
-        merge_partial_results(args.checkpoint_dir, args.output, args.fps, args.world_size, args.total_frames, args.output_mode)
+        merge_partial_results(args.checkpoint_dir, args.output, args.fps, args.world_size, args.total_frames, args.output_mode, args.output_format)
     elif args.recover_rank is not None:
         recover_rank(args.checkpoint_dir, args.recover_rank, vars(args))
     else:

@@ -29,7 +29,7 @@
 
 ### 独立推理脚本（新增！）
 
-使用 `infer_video.py` 可在不使用 ComfyUI 的情况下直接处理视频：
+使用 `scripts/infer_video.py` 或 `scripts/infer_video_distributed.py` 可在不使用 ComfyUI 的情况下直接处理视频：
 
 #### Docker容器内运行
 
@@ -37,7 +37,7 @@
 # 方法一：进入容器后运行
 docker exec -it flashvsr_ultra_fast bash
 cd /app/FlashVSR_Ultra_Fast
-python infer_video.py \
+python scripts/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output.mp4 \
   --mode tiny \
@@ -48,7 +48,7 @@ python infer_video.py \
   --model_dir /app/models
 
 # 方法二：从宿主机直接运行（推荐使用 -w 参数指定工作目录）
-docker exec -w /app/FlashVSR_Ultra_Fast flashvsr_ultra_fast python /app/FlashVSR_Ultra_Fast/infer_video.py \
+docker exec -w /app/FlashVSR_Ultra_Fast flashvsr_ultra_fast python /app/FlashVSR_Ultra_Fast/scripts/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output.mp4 \
   --mode tiny \
@@ -110,7 +110,7 @@ docker exec -w /app/FlashVSR_Ultra_Fast flashvsr_ultra_fast python /app/FlashVSR
 
 **基础4倍超分（显存充足）：**
 ```bash
-python infer_video.py \
+python scripts/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output_4x.mp4 \
   --mode tiny \
@@ -120,7 +120,7 @@ python infer_video.py \
 
 **3倍放大（平衡质量和显存）：**
 ```bash
-python infer_video.py \
+python scripts/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output_3x.mp4 \
   --mode tiny \
@@ -131,7 +131,7 @@ python infer_video.py \
 
 **低显存模式：**
 ```bash
-python infer_video.py \
+python scripts/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output_4x.mp4 \
   --mode tiny-long \
@@ -144,7 +144,7 @@ python infer_video.py \
 
 **多GPU加速（2个以上GPU）：**
 ```bash
-python infer_video.py \
+python scripts/infer_video.py \
   --input /app/input/video.mp4 \
   --output /app/output/output_4x.mp4 \
   --mode tiny \
@@ -435,7 +435,7 @@ python recover_from_workers.py /tmp/flashvsr_multigpu/{video_dir_name} /app/outp
 
 **查找未合并的文件：**
 ```bash
-python find_unmerged.py
+python tools/find_unmerged.py
 ```
 
 ## 致谢

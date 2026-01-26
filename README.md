@@ -29,10 +29,11 @@ Running FlashVSR on lower VRAM without any artifacts.
 
 ### Standalone Inference (New!)
 
-Use `infer_video.py` for standalone video processing without ComfyUI:
+Use `scripts/infer_video.py` or `scripts/infer_video_distributed.py` for standalone video processing without ComfyUI:
 
 ```bash
-python infer_video.py \
+# 单 GPU 或简单场景
+python scripts/infer_video.py \
   --input ./inputs/video.mp4 \
   --output ./results/output.mp4 \
   --mode tiny \
@@ -43,6 +44,14 @@ python infer_video.py \
   --multi_gpu \
   --adaptive_batch_size \
   --model_dir /path/to/FlashVSR
+
+# 多 GPU 分布式推理（推荐）
+python scripts/infer_video_distributed.py \
+  --input ./inputs/video.mp4 \
+  --output ./results/output.mp4 \
+  --mode tiny \
+  --scale 4 \
+  --devices all
 ```
 
 **Key Parameters:**
@@ -257,12 +266,12 @@ If processing is interrupted, you can use recovery tools to manually merge compl
 
 **Recover from worker files:**
 ```bash
-python recover_from_workers.py /tmp/flashvsr_multigpu/{video_dir_name} /app/output/recovered.mp4 --fps 30
+python tools/recover_distributed_inference.py /tmp/flashvsr_multigpu/{video_dir_name} /app/output/recovered.mp4 --fps 30
 ```
 
 **Find unmerged files:**
 ```bash
-python find_unmerged.py
+python tools/find_unmerged.py
 ```
 
 ## Acknowledgments

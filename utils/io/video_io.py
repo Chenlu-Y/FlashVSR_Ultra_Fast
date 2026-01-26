@@ -8,11 +8,12 @@
 """
 import os
 import sys
+import subprocess
+import tempfile
+import numpy as np
 import torch
 import cv2
 import torchvision
-import subprocess
-import tempfile
 
 def log(msg, level="info"):
     """简单的日志函数"""
@@ -23,6 +24,88 @@ def log(msg, level="info"):
         "finish": "[DONE]"
     }.get(level, "[INFO]")
     print(f"{prefix} {msg}")
+
+
+def save_frame_as_dpx10(frame: np.ndarray, path: str, hdr_max: float = None) -> bool:
+    """将单帧 float RGB (H,W,3) 保存为 10-bit DPX。
+    
+    支持 SDR [0,1] 和 HDR (>1) 输入。
+    
+    Args:
+        frame: 输入帧 (H,W,3)，可能是 HDR（值 > 1）
+        path: 输出路径
+        hdr_max: HDR 全局最大值（用于归一化）。如果为 None，使用帧内最大值（每帧独立归一化）。
+                如果提供，使用全局归一化（保留绝对亮度关系）。
+    
+    依赖 FFmpeg，优先用 gbrp10le；若不支持则回退到 rgb48le（10bit 置高位的 16bit 容器）。
+    """
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"save_frame_as_dpx10: need (H,W,3) RGB, got shape {frame.shape}")
+    h, w = frame.shape[0], frame.shape[1]
+    frame = np.ascontiguousarray(frame.astype(np.float32))
+    
+    # 处理 HDR：归一化到 [0, 1]
+    frame_max = frame.max()
+    if frame_max > 1.0:
+        # HDR 输入：使用全局最大值或帧内最大值归一化
+        if hdr_max is not None and hdr_max > 1.0:
+            # 使用全局最大值（保留绝对亮度关系）
+            frame = frame / hdr_max
+        else:
+            # 使用帧内最大值（每帧独立归一化，丢失绝对亮度）
+            frame = frame / frame_max
+    else:
+        # SDR 输入：确保在 [0, 1]
+        frame = np.clip(frame, 0.0, 1.0)
+    
+    # 10-bit: 0–1023（按照图片建议的方式）
+    f10 = (frame * 1023.0).round().clip(0, 1023).astype(np.uint16)
+    # gbrp10le: planar G,B,R，每通道 H*W 个 uint16 LE
+    g = f10[:, :, 1].tobytes()
+    b = f10[:, :, 2].tobytes()
+    r = f10[:, :, 0].tobytes()
+    raw = g + b + r
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "gbrp10le",
+        "-s", f"{w}x{h}", "-r", "1",
+        "-i", "pipe:0",
+        "-frames:v", "1", "-c:v", "dpx",
+        path,
+    ]
+    try:
+        p = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        p.stdin.write(raw)
+        p.stdin.close()
+        p.wait()
+        if p.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+            return True
+    except Exception:
+        pass
+    # 回退：rgb48le，10bit 置于高 10 位
+    f16 = (f10.astype(np.uint32) << 6).astype(np.uint16)
+    raw16 = np.ascontiguousarray(f16).tobytes()
+    cmd2 = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo", "-pix_fmt", "rgb48le",
+        "-s", f"{w}x{h}", "-r", "1",
+        "-i", "pipe:0",
+        "-frames:v", "1", "-c:v", "dpx",
+        path,
+    ]
+    try:
+        p2 = subprocess.Popen(
+            cmd2, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        p2.stdin.write(raw16)
+        p2.stdin.close()
+        p2.wait()
+        return p2.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0
+    except Exception:
+        return False
+
 
 def save_video_streaming(frames_tensor, path, fps=30, batch_size=10):
     """分批保存视频，避免一次性处理所有帧"""
