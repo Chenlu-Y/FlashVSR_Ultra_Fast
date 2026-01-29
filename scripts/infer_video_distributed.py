@@ -653,10 +653,12 @@ def split_video_by_frames(total_frames: int, num_workers: int, overlap: int = 2,
     
     # 如果强制指定worker数量，不减少worker数量
     if not force_num_workers:
-        # 如果视频太短，减少 worker 数量
+        # 仅当「总帧数 < 最小每段帧数 × 当前 worker 数」时缩减，保证每段至少满足算法最小帧数
+        # 动态计算：新 worker 数 = 总帧数 // 最小每段帧数，且至少为 1
         if N < min_frames_per_segment * num_workers:
-            log(f"[Split] Video has only {N} frames, reducing workers from {num_workers} to {min(1, N // min_frames_per_segment)}", "warning", 0)
-            num_workers = max(1, N // min_frames_per_segment)
+            new_num_workers = max(1, N // min_frames_per_segment)
+            log(f"[Split] Video has only {N} frames (each segment needs >= {min_frames_per_segment} frames), reducing workers from {num_workers} to {new_num_workers}", "warning", 0)
+            num_workers = new_num_workers
     else:
         # 强制使用指定的worker数量，即使帧数不足
         if N < min_frames_per_segment * num_workers:
