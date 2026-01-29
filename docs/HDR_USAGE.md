@@ -24,13 +24,15 @@
 ### 基本用法
 
 ```bash
-# 启用 HDR 模式（自动检测 HDR 输入）
+# 启用 HDR + Tone Mapping 工作流
 python infer_video_distributed.py \
     --input /path/to/hdr_dpx_sequence \
     --output_mode pictures \
     --output /path/to/output \
-    --output_format dpx10 \
-    --hdr_mode \
+    --output_format dpx \
+    --output_bit_depth 10 \
+    --dynamic_range hdr \
+    --hdr_preprocess tone_mapping \
     --tone_mapping_method logarithmic
 ```
 
@@ -38,9 +40,11 @@ python infer_video_distributed.py \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--hdr_mode` | 启用 HDR 模式（自动检测并处理） | 关闭 |
+| `--dynamic_range` | 动态范围：`sdr` / `hdr` / `auto`。Tone Mapping 通道下请设为 `hdr` | `sdr` |
+| `--hdr_preprocess` | HDR 预处理方式：`hlg`（HLG 工作流）或 `tone_mapping`（Tone Mapping 工作流） | `hlg` |
 | `--tone_mapping_method` | Tone Mapping 方法：`reinhard` / `logarithmic` / `aces` | `logarithmic` |
 | `--tone_mapping_exposure` | 曝光调整（> 1.0 提亮，< 1.0 压暗） | `1.0` |
+| `--global_l_max` | 全局 `l_max`（可选）。提供后将用于所有帧，避免帧间亮度不一致 | None |
 
 ### Tone Mapping 方法选择
 
@@ -128,37 +132,41 @@ Tone Mapping 参数保存在 checkpoint 目录：
 
 ### 输出格式
 
-- **`--output_format dpx10`**：10-bit DPX，支持 HDR 值（自动归一化）
-- **`--output_format png`**：8-bit PNG，HDR 值会被 clip 到 [0, 1]（会丢失高光）
+- **`--output_mode pictures --output_format dpx --output_bit_depth 10`**：10-bit DPX，支持 HDR 值（自动归一化）
+- **`--output_mode pictures --output_format png --output_bit_depth 8`**：8-bit PNG，HDR 值会被 clip 到 [0, 1]（会丢失高光）
 
-**建议**：HDR 输入时使用 `--output_format dpx10`
+**建议**：HDR 输入时使用 10-bit DPX（`output_format=dpx, output_bit_depth=10`）
 
 ---
 
 ## 示例
 
-### 示例 1：HDR DPX 序列输入，输出 10-bit DPX
+### 示例 1：HDR DPX 序列输入，输出 10-bit DPX（Tone Mapping 通道）
 
 ```bash
 python infer_video_distributed.py \
     --input /data/hdr_input_frames \
     --output_mode pictures \
     --output /data/hdr_output_frames \
-    --output_format dpx10 \
-    --hdr_mode \
+    --output_format dpx \
+    --output_bit_depth 10 \
+    --dynamic_range hdr \
+    --hdr_preprocess tone_mapping \
     --tone_mapping_method logarithmic \
     --scale 4
 ```
 
-### 示例 2：HDR 视频输入，输出 HDR DPX 序列
+### 示例 2：HDR 视频输入，输出 HDR DPX 序列（Tone Mapping 通道）
 
 ```bash
 python infer_video_distributed.py \
     --input /data/hdr_video.mp4 \
     --output_mode pictures \
     --output /data/hdr_output_frames \
-    --output_format dpx10 \
-    --hdr_mode \
+    --output_format dpx \
+    --output_bit_depth 10 \
+    --dynamic_range hdr \
+    --hdr_preprocess tone_mapping \
     --tone_mapping_method reinhard \
     --tone_mapping_exposure 1.2 \
     --scale 4

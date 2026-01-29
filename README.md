@@ -110,14 +110,31 @@ Two inference scripts are available:
 
 #### Distributed Inference Parameters (infer_video_distributed.py only)
 
+**I/O & Format**
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `--output_mode` | str | `video` | Output mode: `video` (video file) or `pictures` (image sequence) |
-| `--output_format` | str | `png` | When `output_mode=pictures`: `png` (8-bit) or `dpx10` (10-bit DPX) |
-| `--hdr_mode` | flag | False | Enable HDR mode: automatic HDR detection, tone mapping, and restoration |
-| `--tone_mapping_method` | str | `logarithmic` | Tone mapping method: `reinhard`, `logarithmic`, or `aces` |
-| `--tone_mapping_exposure` | float | `1.0` | Tone mapping exposure adjustment |
-| `--fps` | float | `30.0` | Frames per second (used when input is image sequence) |
+| `--output_mode` | str | `video` | Output mode: `video` (single video file) or `pictures` (image sequence) |
+| `--output_format` | str | `auto` | When `output_mode=video`: `mp4` / `mov` / `mkv`. If not set (auto), tries to inherit the input video container when the input is a video file, otherwise falls back to `mp4`. When `output_mode=pictures`: `png` / `dpx`, default `png`. |
+| `--output_bit_depth` | int | `8` | Output bit depth: `8` or `10`. For video this maps to `yuv420p` / `yuv420p10le`; for pictures to 8-bit PNG or 10-bit DPX |
+| `--input_fps` | float | `30.0` | Frame rate of input image sequences. Ignored when input is a video file (FPS is probed automatically) |
+| `--output_fps` | float | `None` | Output video FPS, only used when `output_mode=video`. If not set, it automatically inherits the probed input FPS |
+
+**Dynamic Range & HDR Pipeline**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `--dynamic_range` | str | `sdr` | Dynamic range: `sdr` (Standard Dynamic Range), `hdr` (High Dynamic Range), or `auto` (auto-detect) |
+| `--hdr_preprocess` | str | `hlg` | HDR preprocessing (only used when `--dynamic_range=hdr`): `hlg` (PQ→HLG workflow, recommended) or `tone_mapping` (reversible tone-mapping workflow) |
+| `--tone_mapping_method` | str | `logarithmic` | Tone mapping method (only when `--hdr_preprocess=tone_mapping`): `reinhard`, `logarithmic`, or `aces` |
+| `--tone_mapping_exposure` | float | `1.0` | Tone mapping exposure adjustment (used in `tone_mapping` workflow) |
+| `--global_l_max` | float | None | Global `l_max` value (optional, `tone_mapping` workflow only) to control the compression curve and avoid flicker |
+| `--hdr_transfer` | str | `hdr10` | HDR transfer when `output_mode=video` and `dynamic_range=hdr`: `hdr10` (PQ, 10-bit + metadata) or `hlg` (HLG curve). Ignored for SDR or `output_mode=pictures`. |
+
+**Distributed & Scheduling**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
 | `--devices` | str | None | GPU devices to use: `all` (use all GPUs) or comma-separated indices like `0,1,2` or `0-2` (range) |
 | `--master_addr` | str | `localhost` | Master address for distributed training |
 | `--master_port` | int | `29500` | Master port for distributed training |
@@ -167,11 +184,11 @@ python scripts/infer_video_distributed.py \
   --input ./inputs/video.mp4 \
   --output ./results/output.mp4 \
   --output_mode video \
-  --output_format png \
-  --hdr_mode \
-  --tone_mapping_method logarithmic \
-  --tone_mapping_exposure 1.0 \
-  --fps 30.0 \
+  --output_format mp4 \
+  --output_bit_depth 8 \
+  --input_fps 30.0 \
+  --output_fps 30.0 \
+  --dynamic_range sdr \
   --model_ver 1.1 \
   --mode tiny \
   --scale 4 \
@@ -301,16 +318,17 @@ python scripts/infer_video.py \
 
 Best for: HDR input videos, preserving HDR information
 
-**Step 1: Run inference with HDR mode (output linear RGB DPX)**
+**Option A: Direct HDR video output (one command)**  
+Internally writes temporary DPX, encodes to HDR video, then removes temp files.
 
 ```bash
 python scripts/infer_video_distributed.py \
   --input ./inputs/hdr_video.mp4 \
-  --output_mode pictures \
-  --output ./results/hdr_frames \
-  --output_format dpx10 \
-  --hdr_mode \
-  --tone_mapping_method logarithmic \
+  --output ./results/hdr_output.mp4 \
+  --output_mode video \
+  --dynamic_range hdr \
+  --hdr_preprocess hlg \
+  --hdr_transfer hdr10 \
   --mode tiny \
   --scale 2 \
   --tiled_dit True \
@@ -321,7 +339,32 @@ python scripts/infer_video_distributed.py \
   --devices all
 ```
 
-**Step 2: Encode DPX sequence to HDR video (HDR10 format)**
+- `--hdr_transfer hdr10`: Output HDR10 (PQ); use `hlg` for HLG-encoded video.
+
+**Option B: Output DPX sequence, then encode manually**
+
+Step 1: Run inference (output HLG-encoded DPX)
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/hdr_video.mp4 \
+  --output_mode pictures \
+  --output ./results/hdr_frames \
+  --output_format dpx \
+  --output_bit_depth 10 \
+  --dynamic_range hdr \
+  --hdr_preprocess hlg \
+  --mode tiny \
+  --scale 2 \
+  --tiled_dit True \
+  --tiled_vae True \
+  --tile_size 512 \
+  --tile_overlap 384 \
+  --color_fix True \
+  --devices all
+```
+
+Step 2: Encode DPX to HDR video
 
 ```bash
 python utils/io/hdr_video_encode.py \
@@ -329,16 +372,18 @@ python utils/io/hdr_video_encode.py \
   --output ./results/hdr_output.mp4 \
   --fps 30.0 \
   --hdr_format hdr10 \
+  --hlg_workflow \
   --crf 18 \
   --preset slow \
   --simple
 ```
 
-**Key parameters explained:**
-- `--hdr_mode`: Enable HDR processing workflow (Tone Mapping → Super-resolution → Inverse Tone Mapping)
-- `--tile_overlap 384`: Increased overlap to reduce boundary artifacts in high dynamic range areas
-- `--hdr_format hdr10`: Output HDR10 format (use `hlg` for HLG format)
-- `--simple`: Use simplified encoding mode (recommended)
+**Key parameters:**
+- `--dynamic_range hdr`: Use HDR pipeline
+- `--hdr_preprocess hlg`: HLG workflow (recommended); or `tone_mapping` for reversible tone mapping
+- `--hdr_transfer`: When `output_mode=video` and HDR: `hdr10` (PQ) or `hlg`
+- `--output_format dpx --output_bit_depth 10`: For DPX sequence output
+- `--tile_overlap 384`: Increased overlap to reduce boundary artifacts in HDR
 
 #### Scenario 8: Image Sequence Input/Output
 
@@ -350,7 +395,8 @@ python scripts/infer_video_distributed.py \
   --output_mode pictures \
   --output ./results/output_frames \
   --output_format png \
-  --fps 30.0 \
+  --output_bit_depth 8 \
+  --input_fps 30.0 \
   --mode tiny \
   --scale 4 \
   --devices all

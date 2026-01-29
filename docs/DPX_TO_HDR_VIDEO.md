@@ -148,12 +148,14 @@ python scripts/infer_video_distributed.py \
     --input /app/input/test_hdr_4K.mov \
     --output /app/output/test_hdr_8K/ \
     --output_mode pictures \
-    --output_format dpx10 \
-    --hdr_mode \
+    --output_format dpx \
+    --output_bit_depth 10 \
+    --dynamic_range hdr \
+    --hdr_preprocess tone_mapping \
     --tone_mapping_method logarithmic \
     --mode tiny \
     --scale 2 \
-    --fps 30.0
+    --output_fps 30.0
 
 # 2. 转换为 HDR 视频
 python utils/io/hdr_video_encode.py \

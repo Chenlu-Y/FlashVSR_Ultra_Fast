@@ -110,14 +110,31 @@ python -m pip install -U triton<3.3.0
 
 #### 分布式推理参数（仅 infer_video_distributed.py）
 
+**输入 / 输出相关（I/O & Format）**
+
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--output_mode` | str | `video` | 输出模式：`video`（视频文件）或 `pictures`（图像序列） |
-| `--output_format` | str | `png` | 当 `output_mode=pictures` 时：`png`（8位）或 `dpx10`（10位DPX） |
-| `--hdr_mode` | 标志 | False | 启用HDR模式：自动HDR检测、色调映射和还原 |
-| `--tone_mapping_method` | str | `logarithmic` | 色调映射方法：`reinhard`、`logarithmic` 或 `aces` |
-| `--tone_mapping_exposure` | float | `1.0` | 色调映射曝光调整 |
-| `--fps` | float | `30.0` | 帧率（输入为图像序列时使用） |
+| `--output_mode` | str | `video` | 输出模式：`video`（单个视频文件）或 `pictures`（图像序列） |
+| `--output_format` | str | `mp4` / `png` | 当 `output_mode=video` 时：`mp4` / `mov` / `mkv`；当 `output_mode=pictures` 时：`png` / `dpx` |
+| `--output_bit_depth` | int | `8` | 输出位深：`8` 或 `10`（视频模式映射到 `yuv420p` / `yuv420p10le`，图片模式映射到 8bit PNG 或 10bit DPX） |
+| `--input_fps` | float | `30.0` | 输入为图像序列时的帧率（视频文件会自动探测 FPS，不使用该参数） |
+| `--output_fps` | float | `None` | 输出视频的帧率，仅当 `output_mode=video` 时生效。未指定时自动继承输入 FPS |
+
+**动态范围 / HDR 通道（Dynamic Range & HDR）**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--dynamic_range` | str | `sdr` | 动态范围：`sdr`（标准动态范围）/ `hdr`（高动态范围）/ `auto`（自动检测） |
+| `--hdr_preprocess` | str | `hlg` | HDR 预处理方式（仅当 `--dynamic_range=hdr` 时生效）：`hlg`（PQ→HLG 工作流，推荐）或 `tone_mapping`（可逆 Tone Mapping 工作流） |
+| `--tone_mapping_method` | str | `logarithmic` | Tone Mapping 方法（仅当 `--hdr_preprocess=tone_mapping` 时生效）：`reinhard` / `logarithmic` / `aces` |
+| `--tone_mapping_exposure` | float | `1.0` | Tone Mapping 曝光调整（仅在 `tone_mapping` 工作流下使用） |
+| `--global_l_max` | float | None | 全局 `l_max`（可选，仅 `tone_mapping` 工作流使用，用于控制全局压缩曲线，避免频闪） |
+| `--hdr_transfer` | str | `hdr10` | HDR 传输方式（仅当 `output_mode=video` 且 `dynamic_range=hdr` 时生效）：`hdr10`（PQ，10-bit + 元数据）或 `hlg`（HLG 曲线）。SDR 或输出图片序列时忽略。 |
+
+**分布式 / 调度相关（Distributed & Scheduling）**
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
 | `--devices` | str | None | 使用的GPU设备：`all`（使用所有GPU）或逗号分隔的索引如 `0,1,2` 或 `0-2`（范围） |
 | `--master_addr` | str | `localhost` | 分布式训练的主地址 |
 | `--master_port` | int | `29500` | 分布式训练的主端口 |
@@ -167,11 +184,11 @@ python scripts/infer_video_distributed.py \
   --input ./inputs/video.mp4 \
   --output ./results/output.mp4 \
   --output_mode video \
-  --output_format png \
-  --hdr_mode \
-  --tone_mapping_method logarithmic \
-  --tone_mapping_exposure 1.0 \
-  --fps 30.0 \
+  --output_format mp4 \
+  --output_bit_depth 8 \
+  --input_fps 30.0 \
+  --output_fps 30.0 \
+  --dynamic_range sdr \
   --model_ver 1.1 \
   --mode tiny \
   --scale 4 \
@@ -301,16 +318,17 @@ python scripts/infer_video.py \
 
 适用：HDR输入视频，保留HDR信息
 
-**步骤1：运行推理（输出线性RGB DPX）**
+**方式一：直接输出 HDR 视频（一条命令）**  
+内部会先写临时 DPX，再编码为 HDR 视频，最后删除临时文件。
 
 ```bash
 python scripts/infer_video_distributed.py \
   --input ./inputs/hdr_video.mp4 \
-  --output_mode pictures \
-  --output ./results/hdr_frames \
-  --output_format dpx10 \
-  --hdr_mode \
-  --tone_mapping_method logarithmic \
+  --output ./results/hdr_output.mp4 \
+  --output_mode video \
+  --dynamic_range hdr \
+  --hdr_preprocess hlg \
+  --hdr_transfer hdr10 \
   --mode tiny \
   --scale 2 \
   --tiled_dit True \
@@ -321,7 +339,32 @@ python scripts/infer_video_distributed.py \
   --devices all
 ```
 
-**步骤2：将DPX序列编码为HDR视频（HDR10格式）**
+- `--hdr_transfer hdr10`：输出 HDR10（PQ）；若需 HLG 编码视频则用 `hlg`。
+
+**方式二：先输出 DPX 序列，再手动编码**
+
+步骤1：运行推理（输出 HLG 编码 DPX）
+
+```bash
+python scripts/infer_video_distributed.py \
+  --input ./inputs/hdr_video.mp4 \
+  --output_mode pictures \
+  --output ./results/hdr_frames \
+  --output_format dpx \
+  --output_bit_depth 10 \
+  --dynamic_range hdr \
+  --hdr_preprocess hlg \
+  --mode tiny \
+  --scale 2 \
+  --tiled_dit True \
+  --tiled_vae True \
+  --tile_size 512 \
+  --tile_overlap 384 \
+  --color_fix True \
+  --devices all
+```
+
+步骤2：将 DPX 编码为 HDR 视频
 
 ```bash
 python utils/io/hdr_video_encode.py \
@@ -329,16 +372,18 @@ python utils/io/hdr_video_encode.py \
   --output ./results/hdr_output.mp4 \
   --fps 30.0 \
   --hdr_format hdr10 \
+  --hlg_workflow \
   --crf 18 \
   --preset slow \
   --simple
 ```
 
-**关键参数说明：**
-- `--hdr_mode`：启用HDR处理流程（Tone Mapping → 超分 → Inverse Tone Mapping）
-- `--tile_overlap 384`：增加重叠区域，减少高动态范围区域的边界伪影
-- `--hdr_format hdr10`：输出HDR10格式（使用 `hlg` 可输出HLG格式）
-- `--simple`：使用简化编码模式（推荐）
+**关键参数：**
+- `--dynamic_range hdr`：使用 HDR 通道
+- `--hdr_preprocess hlg`：HLG 工作流（推荐）；或 `tone_mapping` 使用可逆 Tone Mapping
+- `--hdr_transfer`：在 `output_mode=video` 且 HDR 时：`hdr10`（PQ）或 `hlg`
+- `--output_format dpx --output_bit_depth 10`：输出 DPX 序列时使用
+- `--tile_overlap 384`：增加重叠区域，减少 HDR 边界伪影
 
 #### 场景8：图像序列输入/输出
 
@@ -350,7 +395,8 @@ python scripts/infer_video_distributed.py \
   --output_mode pictures \
   --output ./results/output_frames \
   --output_format png \
-  --fps 30.0 \
+  --output_bit_depth 8 \
+  --input_fps 30.0 \
   --mode tiny \
   --scale 4 \
   --devices all

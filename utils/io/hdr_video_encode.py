@@ -449,6 +449,66 @@ def encode_hlg_dpx_to_hdr_video(
         return False
 
 
+def encode_hlg_dpx_to_hlg_video(
+    dpx_dir: str,
+    output_path: str,
+    fps: float = 30.0,
+    crf: int = 18,
+    preset: str = 'slow'
+) -> bool:
+    """将 HLG 编码的 DPX 序列编码为 HLG 视频（保持 HLG 传输，不转换到 PQ）。
+
+    - 输入：HLG 编码的 DPX（frame_*.dpx）
+    - 输出：HLG 编码的 HEVC 10-bit 视频（arib-std-b67）
+    """
+    dpx_files = sorted(glob.glob(os.path.join(dpx_dir, "frame_*.dpx")))
+    if not dpx_files:
+        raise ValueError(f"未找到 DPX 文件在目录: {dpx_dir}")
+
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        dpx_files[0]
+    ]
+    try:
+        probe_result = subprocess.run(probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        lines = probe_result.stdout.decode().strip().split('\n')
+        w, h = int(lines[0]), int(lines[1])
+    except Exception as e:
+        raise RuntimeError(f"无法获取 DPX 图像尺寸: {e}")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-pattern_type", "glob",
+        "-i", os.path.join(dpx_dir, "frame_*.dpx"),
+        "-color_primaries", "bt2020",
+        "-color_trc", "arib-std-b67",
+        "-colorspace", "bt2020nc",
+        "-vf", f"scale={w}:{h}:flags=lanczos,format=yuv420p10le",
+        "-c:v", "libx265",
+        "-preset", preset,
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p10le",
+        "-x265-params", "hdr10-opt=1",
+        output_path
+    ]
+    print(f"[HDR Encode] [HLG] 找到 {len(dpx_files)} 个 HLG DPX，编码为 HLG 视频: {output_path}")
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"[HDR Encode] [HLG] ✓ 编码成功: {output_path}")
+            return True
+        stderr = result.stderr.decode('utf-8', errors='ignore')
+        print(f"[HDR Encode] [HLG] ✗ 编码失败: {stderr[-1000:] if len(stderr) > 1000 else stderr}")
+        return False
+    except Exception as e:
+        print(f"[HDR Encode] [HLG] ✗ 异常: {e}")
+        return False
+
+
 def _encode_hlg_dpx_simple_fallback(
     dpx_dir: str,
     output_path: str,
