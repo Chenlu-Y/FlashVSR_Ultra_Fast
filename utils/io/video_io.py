@@ -196,15 +196,16 @@ def save_video_streaming(frames_tensor, path, fps=30, batch_size=10):
         log(f"流式保存失败: {e}，回退到普通方法", "warning")
         return False
 
-def save_video(frames, path, fps=30):
+def save_video(frames, path, fps=30, hdr_mode=False):
     """Save tensor video frames to MP4 with H.264 encoding for Windows compatibility.
     
     Priority: FFmpeg subprocess (H.264) > torchvision.io.write_video > OpenCV with H.264 > OpenCV with mp4v
     frames is (F, H, W, C) format.
+    hdr_mode: 兼容参数，当前实现仅做 SDR 保存（clamp 到 [0,1]）；传 True 时仍按 SDR 处理。
     """
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
     
-    # Convert frames to numpy for all methods
+    # Convert frames to numpy for all methods (SDR: clamp to [0,1]; hdr_mode 仅保留接口兼容)
     frames_np = (frames.clamp(0, 1) * 255).byte().cpu().numpy().astype('uint8')
     h, w = frames_np.shape[1:3]
     num_frames = frames_np.shape[0]

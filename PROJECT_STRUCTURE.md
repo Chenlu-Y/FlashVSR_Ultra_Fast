@@ -7,8 +7,8 @@ FlashVSR_Ultra_Fast/
 ├── README.md, README_zh.md, LICENSE, requirements.txt  # 根目录文档
 │
 ├── scripts/                    # 主要推理脚本（入口点）
-│   ├── infer_video.py
-│   └── infer_video_distributed.py
+│   ├── infer_video.py              # 推理入口（参数解析、流程编排、单/多 GPU 启动）
+│   └── inference_runner.py         # 推理执行核心（单卡/多卡、分片、tile、pipeline 加载与运行）
 │
 ├── tools/                      # 工具脚本
 │   ├── batch_process.py
@@ -18,8 +18,10 @@ FlashVSR_Ultra_Fast/
 │
 ├── utils/                      # 工具函数模块
 │   ├── __init__.py
+│   ├── inference_support/      # 推理支持（tensor/video、tile 几何、显存估算等）
 │   ├── io/                     # 输入输出相关
 │   │   ├── __init__.py
+│   │   ├── inference_io.py     # 推理 I/O 与 HDR/SDR 编排（帧输入、Tone Mapping、保存、分布式合并）
 │   │   ├── video_io.py         # 原 save_recovered_video.py
 │   │   └── hdr_io.py           # 原 read_hdr_input.py
 │   └── hdr/                    # HDR 相关工具
@@ -51,8 +53,9 @@ FlashVSR_Ultra_Fast/
 ### 已移动的文件
 
 1. **主要推理脚本** → `scripts/`
-   - `infer_video.py` → `scripts/infer_video.py`
-   - `infer_video_distributed.py` → `scripts/infer_video_distributed.py`
+   - 入口脚本命名为 `scripts/infer_video.py`（参数解析、流程编排、单/多 GPU 启动）
+   - `scripts/inference_runner.py`：推理执行核心（单卡/多卡、分片、tile、pipeline 加载与运行）
+   - I/O 与 HDR/SDR 编排已迁至 `utils/io/inference_io.py`，入口与 inference_runner 均依赖该模块
 
 2. **工具脚本** → `tools/`
    - `batch_process.py` → `tools/batch_process.py`
@@ -60,22 +63,26 @@ FlashVSR_Ultra_Fast/
    - `recover_distributed_inference.py` → `tools/recover_distributed_inference.py`
    - `recover_all_segments.py` → `tools/recover_all_segments.py`
 
-3. **HDR 相关** → `utils/hdr/` 和 `utils/io/`
+3. **推理支持** → `utils/`
+   - `utils/inference_support/`：tensor/video 转换、tile 几何、显存估算等纯函数（包）
+   - `utils/io/inference_io.py`：推理 I/O 与 HDR/SDR 编排（帧输入、Tone Mapping、保存、分布式合并）
+
+4. **HDR 相关** → `utils/hdr/` 和 `utils/io/`
    - `hdr_tone_mapping.py` → `utils/hdr/tone_mapping.py`
    - `read_hdr_input.py` → `utils/io/hdr_io.py`
    - `save_recovered_video.py` → `utils/io/video_io.py`
 
-4. **测试文件** → `tests/`
+5. **测试文件** → `tests/`
    - `test_hdr_integration.py` → `tests/test_hdr_integration.py`
    - `test_hdr_support.py` → `tests/test_hdr_support.py`
    - `test_tone_mapping.py` → `tests/test_tone_mapping.py`
 
-5. **文档** → `docs/`
+6. **文档** → `docs/`
    - `HDR_USAGE.md` → `docs/HDR_USAGE.md`
    - `HDR_NORMALIZATION_EXPLANATION.md` → `docs/HDR_NORMALIZATION_EXPLANATION.md`
    - `hdr_integration_plan.md` → `docs/hdr_integration_plan.md`
 
-6. **数据文件** → `data/`
+7. **数据文件** → `data/`
    - `posi_prompt.pth` → `data/posi_prompt.pth`
 
 ## 更新的导入路径
@@ -108,7 +115,7 @@ python recover_distributed_inference.py --checkpoint_dir ...
 
 ### 新方式
 ```bash
-python scripts/infer_video_distributed.py --input video.mp4 --output output.mp4
+python scripts/infer_video.py --input video.mp4 --output output.mp4
 python tools/recover_distributed_inference.py --checkpoint_dir ...
 ```
 
