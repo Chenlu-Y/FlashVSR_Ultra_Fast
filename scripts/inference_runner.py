@@ -1201,6 +1201,7 @@ def run_distributed_inference(
             ) as f:
                 f.write(f"rank_{rank}_skipped\n")
             return
+        t0 = time.perf_counter()
         start_idx, end_idx = segments[rank]
         enable_hdr = getattr(args, "_enable_hdr", False)
         segment_frames = inference_io.read_input_frames_range(
@@ -1244,6 +1245,12 @@ def run_distributed_inference(
         if rank == 0:
             inference_io.merge_and_save_distributed_results(
                 checkpoint_dir, args, world_size, total_frames, input_fps
+            )
+            elapsed_min = (time.perf_counter() - t0) / 60.0
+            log(
+                f"[Distributed] ✓ Inference done: {total_frames} frames, total {elapsed_min:.1f} min",
+                "info",
+                0,
             )
     except Exception as e:
         log(f"[Rank {rank}] FATAL: {e}", "error", rank)
